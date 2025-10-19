@@ -1,3 +1,4 @@
+# findmy/keychain/escrow.py
 import plistlib
 import base64
 import struct
@@ -141,8 +142,8 @@ class EscrowClient:
 
         # --- FIX: Reverted to correct srp library attributes ---
         # Use the same 2048-bit group as the Rust library
-        self.srp_client = srp.Client(
-            srp.constants.GROUP_2048, srp.SHA256
+        self.srp_client = srp.Client(  # type: ignore
+            srp.constants.GROUP_2048, srp.SHA256  # type: ignore
         )
         # --- END FIX ---
 
@@ -152,7 +153,7 @@ class EscrowClient:
         Ported from `invoke_escrow` in keychain.rs.
         """
         # This Pylance warning is safe to ignore.
-        url = f"{self.host}/escrowproxy/api/{request_dict['command']}"
+        url = f"{self.host}/escrowproxy/api/{request_dict['command']}"  # type: ignore
 
         anisette_headers = await self.anisette.get_anisette_headers()
 
@@ -342,7 +343,7 @@ class EscrowClient:
         curve = ec.SECP384R1()
 
         # This is a Pylance false positive
-        order = curve.order
+        order = curve.order  # type: ignore
 
         # (entropy % (order - 1)) + 1
         private_scalar = (private_val_int % (order - 1)) + 1
