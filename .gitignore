@@ -165,3 +165,4 @@ airtag.plist
 DO_NOT_COMMIT*
 .direnv/
 accessories/
+.DS_Store

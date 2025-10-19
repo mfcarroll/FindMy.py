@@ -14,6 +14,10 @@ dependencies = [
     "bleak>=1.0.0,<2.0.0",
     "typing-extensions>=4.12.2,<5.0.0",
     "anisette>=1.2.4,<2.0.0",
+    "asn1crypto",
+    "miscreant",
+    "cbor2",
+    "protobuf",
 ]
 
 [dependency-groups]
