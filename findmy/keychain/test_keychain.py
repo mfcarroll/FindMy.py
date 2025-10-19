@@ -1,167 +1,173 @@
-# findmy/keychain/test_keychain.py
+import os
+import sys
 import asyncio
-import aiohttp
 import requests
-import plistlib
-import getpass
-from typing import cast, TYPE_CHECKING, Any
-from yarl import URL
+import getpass  # --- Use getpass for interactive password prompt ---
+from typing import cast, Any
 
-# --- Use correct class names from provided files ---
+# --- Service 1: Reports (for Auth) ---
 from findmy.reports.account import AsyncAppleAccount
-from findmy.reports.anisette import LocalAnisetteProvider
+from findmy.reports.state import LoginState
+from findmy.reports.anisette import get_provider_from_mapping, AnisetteMapping
+from findmy.reports.twofactor import (
+    AsyncSmsSecondFactor,
+    AsyncTrustedDeviceSecondFactor,
+)
 
-# --- Import our NEW keychain classes ---
-from findmy.keychain.cloudkit_session import CloudKitSession
-from findmy.keychain.keychain_access import KeychainAccess
+# --- Service 2: Escrow (for MasterKey) ---
 from findmy.keychain.escrow import EscrowClient
 
-# Define the 2FA callback function
-async def handle_2fa(device: Any) -> str:
-    """Handles the 2FA input prompt."""
-    code = input(f"Enter 2FA code sent to device (or via SMS): ")
-    return code.strip()
+# --- Service 3: CloudKit (for Secrets) ---
+from findmy.keychain.keychain_access import KeychainAccess
+from findmy.keychain.cloudkit_session import CloudKitSession
+
 
 async def main():
-    # --- Get credentials securely ---
-    apple_id_prompt = input("Enter Apple ID: ")
-    password_prompt = getpass.getpass("Enter Password: ")
-    # -------------------------------
+    """Runs the full login, escrow recovery, and keychain fetch."""
 
-    # 1. --- Perform login using your existing Account class ---
-    print("\nLogging in to iCloud...")
+    # --- Use interactive login instead of os.environ ---
+    try:
+        apple_id = input("Enter Apple ID: ")
+        password = getpass.getpass("Enter Password: ")
+    except (EOFError, KeyboardInterrupt):
+        print("\nLogin cancelled.")
+        sys.exit(1)
+        
+    print(f"Logging in to {apple_id}...")
 
-    async with aiohttp.ClientSession() as aio_session:
-        anisette = LocalAnisetteProvider()
+    # --- 1. REPORTS: AUTHENTICATION (Async) ---
+    
+    anisette_mapping = cast(AnisetteMapping, {"type": "native"})
+    anisette = get_provider_from_mapping(anisette_mapping)
+    
+    acc = AsyncAppleAccount(anisette=anisette)
+    
+    # 1a. GSA Authenticate (Pass interactive credentials)
+    try:
+        state = await acc._gsa_authenticate(apple_id, password)
+    except Exception as e:
+        print(f"GSA Authentication failed: {e}")
+        await acc.close()
+        sys.exit(1)
 
-        # Initialize Account with only anisette
-        account = AsyncAppleAccount(
-            anisette=anisette
-        )
+    pet_token = acc._login_state_data.get("idms_pet")
+    if not pet_token:
+        print("Failed to get 'idms_pet' (pet_token) from GSA auth.")
+        await acc.close()
+        sys.exit(1)
 
-        try:
-            # --- FIX: Pass credentials to login method ---
-            await account.login(
-                apple_id=apple_id_prompt,
-                password=password_prompt,
-                two_factor_callback=handle_2fa
-            )
-            # ---------------------------------------------
-        except Exception as e:
-            print(f"Login failed: {e}")
-            import traceback
-            traceback.print_exc()
-            return
+    # 1b. Handle 2FA
+    if state == LoginState.REQUIRE_2FA:
+        print("2FA required.")
+        methods = await acc.get_2fa_methods()
+        if not methods:
+            print("No 2FA methods found.")
+            await acc.close()
+            sys.exit(1)
 
-        if not account.account_info: # type: ignore
-            print("Login failed (no account info returned).")
-            return
-
-        print("Login successful.")
-
-        # --- 2. Extract all required tokens from the Account object ---
-        print("Extracting login tokens for Escrow and CloudKit...")
-        try:
-            dsid = str(account.account_info["dsid"]) # type: ignore
-            # --- FIX: Use credentials stored internally by Account (likely in _state) ---
-            # Accessing protected members is generally discouraged, but necessary here
-            # if apple_id/password aren't exposed publicly after login.
-            username = account._state.apple_id # type: ignore
-            password_internal = account._state.password # type: ignore
-            if not username or not password_internal:
-                 raise ValueError("Could not retrieve username/password from account state after login.")
-            # -------------------------------------------------------------------------
-
-            mme_delegate = account.delegates["com.apple.mobileme"] # type: ignore
-            pet_token = account.tokens["com.apple.gs.idms.pet"] # type: ignore
-            mme_auth_token = mme_delegate["tokens"]["mmeAuthToken"]
-            escrow_host = mme_delegate["com.apple.mobileme"]["escrowProxyUrl"]
-
-            ck_token_cookie = aio_session.cookie_jar.filter_cookies(URL("https://idmsa.apple.com")).get("ck-token")
-            if not ck_token_cookie:
-                raise ValueError("ck-token cookie not found after login.")
-            ck_token = ck_token_cookie.value
-
-        except (KeyError, AttributeError, ValueError) as e:
-            print(f"Failed to get required tokens or credentials from Account object: {e}")
-            return
-
-        # --- 3. Run Escrow Recovery to get the MasterKey ---
-        print("Performing Escrow Recovery to get MasterKey...")
-
-        escrow = EscrowClient(
-            session=aio_session,
-            anisette=anisette,
-            dsid=dsid,
-            username=username, # Use username retrieved from account state
-            pet_token=pet_token,
-            mme_auth_token=mme_auth_token,
-            escrow_host=escrow_host
-        )
+        print("Select a 2FA method:")
+        for i, method in enumerate(methods):
+            if isinstance(method, AsyncSmsSecondFactor):
+                print(f"  {i}: SMS ({method.phone_number})")
+            elif isinstance(method, AsyncTrustedDeviceSecondFactor):
+                print(f"  {i}: Trusted Device")
 
         try:
-             # --- FIX: Use password retrieved from account state ---
-            master_key_pem = await escrow.recover_master_key(password=password_internal)
-             # ------------------------------------------------------
-            print("Successfully retrieved MasterKey!")
-        except Exception as e:
-            print(f"Failed to get MasterKey: {e}")
-            import traceback
-            traceback.print_exc()
-            return
+            idx = int(input(f"Enter choice (0-{len(methods)-1}): "))
+            method = methods[idx]
+        except (ValueError, IndexError, EOFError, KeyboardInterrupt):
+            print("\nInvalid selection or cancelled.")
+            await acc.close()
+            sys.exit(1)
 
-        # --- 4. Initialize CloudKit and KeychainAccess ---
-        print("Initializing CloudKit session...")
+        await method.request()
+        
+        try:
+            code = input("Enter 2FA code: ")
+        except (EOFError, KeyboardInterrupt):
+            print("\n2FA cancelled.")
+            await acc.close()
+            sys.exit(1)
+            
+        state = await method.submit(code)
+
+    # 1c. MobileMe Login
+    if state == LoginState.AUTHENTICATED:
+        state = await acc._login_mobileme()
+
+    if state != LoginState.LOGGED_IN:
+        print(f"Login failed with final state: {state}")
+        await acc.close()
+        sys.exit(1)
+        
+    print("Login successful. Extracting tokens...")
+
+    # --- 2. ESCROW: MASTER KEY RECOVERY (Async) ---
+
+    dsid = acc._login_state_data["dsid"]
+    service_data = acc._login_state_data["mobileme_data"]["service-data"]
+    tokens = acc._login_state_data["mobileme_data"]["tokens"]
+    mme_auth_token = tokens["mmeAuthToken"]
+    escrow_host = service_data["escrowHost"]
+    
+    aiohttp_session = await acc._http._get_session()
+
+    escrow_client = EscrowClient(
+        session=aiohttp_session,
+        anisette=anisette,
+        dsid=dsid,
+        username=apple_id,
+        pet_token=pet_token,
+        mme_auth_token=mme_auth_token,
+        escrow_host=escrow_host,
+    )
+
+    try:
+        print("Recovering MasterKey from escrow...")
+        # Pass the interactive password to the escrow client
+        master_key_pem = await escrow_client.recover_master_key(password)
+        print("Successfully recovered MasterKey.")
+    except Exception as e:
+        print(f"Failed to recover MasterKey: {e}")
+        await acc.close()
+        sys.exit(1)
+        
+    await acc.close()
+
+    # --- 3. CLOUDKIT: FETCH SECRETS (Sync) ---
+    
+    print("Initializing sync CloudKit session...")
+    
+    ck_token = tokens["searchPartyToken"]
+    
+    def get_secrets_sync() -> list:
         req_session = requests.Session()
-        for cookie in aio_session.cookie_jar:
-            req_session.cookies.set(
-                cookie.key,
-                cookie.value,
-                domain=cookie["domain"],
-                path=cookie["path"]
-            )
 
         ck_session = CloudKitSession(
             dsid=dsid,
             ck_token=ck_token,
             session=req_session,
-            anisette_provider=anisette
+            anisette_provider=anisette,
         )
 
-        keychain = KeychainAccess(ck_session)
+        kc = KeychainAccess(ck_session)
+        kc.keystore["MasterKey"] = master_key_pem
 
-        # --- 5. SEED THE KEYSTORE ---
-        keychain.keystore["MasterKey"] = master_key_pem
-        print("Keystore seeded with MasterKey.")
+        return kc.get_device_secrets()
 
-        # --- 6. RUN THE FINAL TEST ---
-        try:
-            print("Attempting to retrieve device secrets from iCloud Keychain...")
-            secrets = await asyncio.to_thread(keychain.get_device_secrets)
+    try:
+        keychain_items = await asyncio.to_thread(get_secrets_sync)
+        
+        print("---")
+        print(f"Successfully fetched keychain. Found {len(keychain_items)} items.")
+        for item in keychain_items:
+            # The final decrypted item is a plist (dict)
+            print(f"- Item (acct: {item.get('acct')}, svce: {item.get('svce')})")
 
-            if secrets:
-                print(f"\n--- SUCCESS: Found {len(secrets)} device secrets ---")
-                for i, secret_plist in enumerate(secrets):
-                    print(f"\nSecret #{i+1}:")
-                    secret_data = secret_plist.get('v_Data')
-                    if secret_data:
-                        try:
-                            inner_plist = plistlib.loads(secret_data)
-                            print(f"  Decoded Plist Data: {inner_plist}")
-                        except Exception:
-                             print(f"  v_Data (bytes): {secret_data[:100]}...")
-                    else:
-                        print(f"  Full Plist: {secret_plist}")
-            else:
-                print("\n--- Process finished. No device secrets found. ---")
+    except Exception as e:
+        print(f"Failed to fetch keychain secrets: {e}")
+        sys.exit(1)
 
-        except Exception as e:
-            print(f"\n--- AN ERROR OCCURRED during secret retrieval ---")
-            import traceback
-            traceback.print_exc()
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\nExiting.")
+    asyncio.run(main())
