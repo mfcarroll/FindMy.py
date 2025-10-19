@@ -369,6 +369,8 @@ class AsyncAppleAccount(BaseAppleAccount):
         )
         self._login_state_data: dict = state_info["login"]["data"] if state_info else {}
 
+        self._idms_pet: str | None = None
+
         self._account_info: _AccountInfo | None = (
             state_info["account"]["info"] if state_info else None
         )
@@ -865,6 +867,10 @@ class AsyncAppleAccount(BaseAppleAccount):
             logger.info("GSA authentication successful")
 
             idms_pet = spd.get("t", {}).get("com.apple.gs.idms.pet", {}).get("token", "")
+
+            # Save idms_pet token for masterkey escrow
+            self._idms_pet = idms_pet
+
             return self._set_login_state(
                 LoginState.AUTHENTICATED,
                 {"idms_pet": idms_pet, "adsid": spd["adsid"]},
@@ -899,18 +905,30 @@ class AsyncAppleAccount(BaseAppleAccount):
             data=data,
             headers=headers,
         )
-        data = resp.plist()
+        response_data = resp.plist()
 
-        mobileme_data = data.get("delegates", {}).get("com.apple.mobileme", {})
-        status = mobileme_data.get("status") or data.get("status")
+        # --- ADD THIS DEBUG BLOCK ---
+        print("--- DEBUG: Raw MobileMe Login Response ---")
+        import pprint
+        pprint.pprint(response_data) 
+        print("--- END DEBUG ---")
+        # --- END ADDITION ---
+
+        mobileme_data = response_data.get("delegates", {}).get("com.apple.mobileme", {})
+        status = mobileme_data.get("status") or response_data.get("status")
         if status != 0:
-            status_message = mobileme_data.get("status-message") or data.get("status-message")
+            status_message = mobileme_data.get("status-message") or response_data.get("status-message")
             msg = f"com.apple.mobileme login failed with status {status}: {status_message}"
             raise UnhandledProtocolError(msg)
 
+        # Save 'service-data' AND the 'config' dictionary *from within* the mobileme_data delegate
         return self._set_login_state(
             LoginState.LOGGED_IN,
-            {"dsid": data["dsid"], "mobileme_data": mobileme_data["service-data"]},
+            {
+                "dsid": response_data["dsid"], 
+                "mobileme_data": mobileme_data.get("service-data", {}), # Get service-data from delegate
+                "config": mobileme_data.get("config", {}) # Get config *from delegate*
+            }
         )
 
     async def _sms_2fa_request(
@@ -985,6 +1003,15 @@ class AsyncAppleAccount(BaseAppleAccount):
     ) -> dict[str, str]:
         """See :meth:`BaseAppleAccount.get_anisette_headers`."""
         return await self._anisette.get_headers(self._uid, self._devid, serial, with_client_info)
+
+    @property
+    def idms_pet(self) -> str | None:
+        """
+        The GsIdmsToken, required for escrow operations.
+        This is only available after a successful GSA authentication
+        and may be cleared on subsequent logins.
+        """
+        return self._idms_pet
 
 
 class AppleAccount(BaseAppleAccount):
