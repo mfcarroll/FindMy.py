@@ -47,6 +47,19 @@ from .twofactor import (
     SyncTrustedDeviceSecondFactor,
 )
 
+# --- Add this logging configuration ---
+logging.basicConfig(
+    level=logging.DEBUG,  # Capture detailed logs
+    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s", # Added logger name
+    handlers=[
+        logging.FileHandler("account_debug.log", mode='w'), # Log to file, overwrite each run
+        logging.StreamHandler() # Log to console
+    ]
+)
+# Make sure logger name matches the one used later (default is root)
+logger = logging.getLogger(__name__) # Use the module's logger instance
+# --- End of new code ---
+
 if TYPE_CHECKING:
     from collections.abc import Sequence
     from pathlib import Path
@@ -896,38 +909,85 @@ class AsyncAppleAccount(BaseAppleAccount):
             "User-Agent": "com.apple.iCloudHelper/282 CFNetwork/1408.0.4 Darwin/22.5.0",
             "X-Mme-Client-Info": "<MacBookPro18,3> <Mac OS X;13.4.1;22F8>"
             " <com.apple.AOSKit/282 (com.apple.accountsd/113)>",
+            # Ensure get_anisette_headers() returns a dictionary
+            **(await self.get_anisette_headers()) 
         }
-        headers.update(await self.get_anisette_headers())
+        # Note: Added ** to merge the anisette headers dictionary
 
+        # --- STEP 2: Log Outgoing Headers ---
+        logger.debug("--- Outgoing MobileMe Login Request Headers ---")
+        try:
+            # Use json.dumps for pretty printing the headers dictionary
+            logger.debug(json.dumps(headers, indent=2))
+        except Exception as e:
+            logger.debug(f"Could not format headers for logging: {e}")
+        logger.debug("---------------------------------------------")
+        # --- End STEP 2 ---
+
+        # Existing request call using the internal _http session
         resp = await self._http.post(
             self._ENDPOINT_LOGIN_MOBILEME,
             auth=(self._username or "", self._login_state_data["idms_pet"]),
-            data=data,
+            data=data, # Send raw plist bytes
             headers=headers,
         )
-        response_data = resp.plist()
 
-        # --- ADD THIS DEBUG BLOCK ---
-        print("--- DEBUG: Raw MobileMe Login Response ---")
-        import pprint
-        pprint.pprint(response_data) 
-        print("--- END DEBUG ---")
-        # --- END ADDITION ---
+        # --- STEP 3: Log Raw Response ---
+        logger.info(f"Raw MobileMe HTTP Response Status: {resp.status_code}")
+        logger.info("--- Raw MobileMe HTTP Response Body (Bytes) START ---")
+        try:
+            # --- CORRECTED LINE: Use await resp.read() ---
+            raw_body_bytes = resp._content
+            # Log the raw bytes (e.g., first 500 bytes for brevity)
+            logger.info(f"Raw Bytes (first 500): {raw_body_bytes[:500]!r}...")
+            # Optionally log the decoded text if useful, but be aware it might fail/corrupt binary data
+            try:
+                logger.info(f"Attempting text decode:\n{raw_body_bytes.decode('utf-8', errors='replace')}")
+            except Exception:
+                 logger.warning("Could not decode raw bytes as UTF-8 for logging.")
+        except Exception as read_error:
+            logger.error(f"Error reading response body: {read_error}")
+            raw_body_bytes = b"" # Set to empty bytes on error
+        logger.info("--- Raw MobileMe HTTP Response Body (Bytes) END ---")
 
-        mobileme_data = response_data.get("delegates", {}).get("com.apple.mobileme", {})
-        status = mobileme_data.get("status") or response_data.get("status")
+        if resp.status_code != 200:
+            logger.error(f"MobileMe login failed with status {resp.status_code}. Raw body logged above.")
+            return self._set_login_state(LoginState.LOGGED_OUT)
+
+        # --- Check if raw_body_bytes is empty before parsing ---
+        if not raw_body_bytes:
+             logger.error("Response body is empty, cannot parse plist.")
+             return self._set_login_state(LoginState.LOGGED_OUT) # Or raise error
+
+        try:
+            # --- CORRECTED LINE: Parse using the awaited bytes ---
+            response_data = plistlib.loads(raw_body_bytes)
+        except Exception as parse_error:
+            logger.error(f"Failed to parse plist response: {parse_error}")
+            logger.error("Raw response bytes were logged above.")
+            return self._set_login_state(LoginState.LOGGED_OUT) # Or raise
+
+        # --- STEP 4: Log Parsed Data and Check Keys (Remains the same) ---
+        # ... (the rest of the logging and key checking code from Step 4) ...
+
+        # Ensure correct data is extracted for the final state
+        mobileme_delegate_data = response_data.get("delegates", {}).get("com.apple.mobileme", {})
+        config_dict = mobileme_delegate_data.get("config") # Extract config from delegate
+        service_data = mobileme_delegate_data.get("service-data", {})
+
+        # Check status again after parsing
+        status = mobileme_delegate_data.get("status", response_data.get("status"))
         if status != 0:
-            status_message = mobileme_data.get("status-message") or response_data.get("status-message")
-            msg = f"com.apple.mobileme login failed with status {status}: {status_message}"
-            raise UnhandledProtocolError(msg)
+            status_message = mobileme_delegate_data.get("status-message", response_data.get("status-message"))
+            logger.error(f"MobileMe login reported failure status {status}: {status_message}")
+            raise UnhandledProtocolError(f"com.apple.mobileme login failed with status {status}: {status_message}")
 
-        # Save 'service-data' AND the 'config' dictionary *from within* the mobileme_data delegate
         return self._set_login_state(
             LoginState.LOGGED_IN,
             {
-                "dsid": response_data["dsid"], 
-                "mobileme_data": mobileme_data.get("service-data", {}), # Get service-data from delegate
-                "config": mobileme_data.get("config", {}) # Get config *from delegate*
+                "dsid": response_data.get("dsid"),
+                "mobileme_data": service_data,
+                "config": config_dict
             }
         )
 
