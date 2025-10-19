@@ -101,6 +101,9 @@ class KeychainAccess:
         if not wrapped_key or not parent_ref:
             raise Exception(f"Key {key_id} has no parent. It may be a root key "
                             f"that must be provided by the auth flow.")
+        
+        if not parent_ref.record_identifier:
+             raise ValueError(f"Parent ref for key {key_id} is missing record_identifier")
 
         parent_key_id = parent_ref.record_identifier.record_name
         # wrapped_key is already bytes from _get_b64_field
@@ -145,7 +148,6 @@ class KeychainAccess:
                     record = record_change.record
                     record_name = record.record_identifier.record_name
                     
-                    # Pylance will error here, but it's correct at runtime
                     if record_change.type == pb.RecordZoneChangesResponse.Change.DELETE:
                         self.keychain_items[zone_name].pop(record_name, None)
                     else: # CREATE or UPDATE
@@ -203,7 +205,7 @@ class KeychainAccess:
             # --- FIX: Fix typo and add None checks ---
             if not wrapped_key or not parent_ref:
                 raise ValueError("Item is missing wrappedKey or parentKeyRef")
-
+                
             if not parent_ref.record_identifier:
                 raise ValueError("Parent ref is missing record_identifier")
             if not parent_ref.zone_identifier:
