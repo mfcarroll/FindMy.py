@@ -2,10 +2,10 @@ import os
 import sys
 import asyncio
 import requests
-import getpass  # --- Use getpass for interactive password prompt ---
+import getpass
 from typing import cast, Any
 
-# --- Service 1: Reports (for Auth) ---
+# Import the main (async) account class
 from findmy.reports.account import AsyncAppleAccount
 from findmy.reports.state import LoginState
 from findmy.reports.anisette import get_provider_from_mapping, AnisetteMapping
@@ -13,11 +13,7 @@ from findmy.reports.twofactor import (
     AsyncSmsSecondFactor,
     AsyncTrustedDeviceSecondFactor,
 )
-
-# --- Service 2: Escrow (for MasterKey) ---
 from findmy.keychain.escrow import EscrowClient
-
-# --- Service 3: CloudKit (for Secrets) ---
 from findmy.keychain.keychain_access import KeychainAccess
 from findmy.keychain.cloudkit_session import CloudKitSession
 
@@ -25,7 +21,6 @@ from findmy.keychain.cloudkit_session import CloudKitSession
 async def main():
     """Runs the full login, escrow recovery, and keychain fetch."""
 
-    # --- Use interactive login instead of os.environ ---
     try:
         apple_id = input("Enter Apple ID: ")
         password = getpass.getpass("Enter Password: ")
@@ -37,24 +32,13 @@ async def main():
 
     # --- 1. REPORTS: AUTHENTICATION (Async) ---
     
-    anisette_mapping = cast(AnisetteMapping, {"type": "native"})
+    anisette_mapping = cast(AnisetteMapping, {"type": "aniLocal", "prov_data": None})
     anisette = get_provider_from_mapping(anisette_mapping)
     
     acc = AsyncAppleAccount(anisette=anisette)
     
-    # 1a. GSA Authenticate (Pass interactive credentials)
-    try:
-        state = await acc._gsa_authenticate(apple_id, password)
-    except Exception as e:
-        print(f"GSA Authentication failed: {e}")
-        await acc.close()
-        sys.exit(1)
-
-    pet_token = acc._login_state_data.get("idms_pet")
-    if not pet_token:
-        print("Failed to get 'idms_pet' (pet_token) from GSA auth.")
-        await acc.close()
-        sys.exit(1)
+    # We can now use the high-level login() method
+    state = await acc.login(apple_id, password)
 
     # 1b. Handle 2FA
     if state == LoginState.REQUIRE_2FA:
@@ -89,11 +73,8 @@ async def main():
             await acc.close()
             sys.exit(1)
             
+        # The high-level submit() is now fine to use
         state = await method.submit(code)
-
-    # 1c. MobileMe Login
-    if state == LoginState.AUTHENTICATED:
-        state = await acc._login_mobileme()
 
     if state != LoginState.LOGGED_IN:
         print(f"Login failed with final state: {state}")
@@ -104,11 +85,39 @@ async def main():
 
     # --- 2. ESCROW: MASTER KEY RECOVERY (Async) ---
 
+    # Extract data using the modified structure in account.py
+    mobileme_data = acc._login_state_data["mobileme_data"]
+    config_data = acc._login_state_data.get("config", {}) # Get the saved config dict
     dsid = acc._login_state_data["dsid"]
-    service_data = acc._login_state_data["mobileme_data"]["service-data"]
-    tokens = acc._login_state_data["mobileme_data"]["tokens"]
+    tokens = mobileme_data["tokens"] 
     mme_auth_token = tokens["mmeAuthToken"]
-    escrow_host = service_data["escrowHost"]
+    
+    # --- ADD DEBUG PRINT ---
+    print("--- DEBUG: Config Data ---")
+    import pprint
+    pprint.pprint(config_data)
+    print("--- END DEBUG ---")
+    # --- END ADDITION ---
+
+    keychain_sync_config = config_data.get("com.apple.Dataclass.KeychainSync", {})
+    escrow_host = keychain_sync_config.get("escrowProxyUrl")
+    
+    if not escrow_host:
+        print("ERROR: Could not find 'escrowProxyUrl' in login response config.")
+        # Optional: Print the config_data for further debugging if needed
+        # print("--- DEBUG: Config Data ---")
+        # import pprint
+        # pprint.pprint(config_data)
+        # print("--- END DEBUG ---")
+        await acc.close()
+        sys.exit(1)
+
+    pet_token = acc.idms_pet
+    
+    if not pet_token:
+        print("Failed to get 'idms_pet' (pet_token) from account object.")
+        await acc.close()
+        sys.exit(1)
     
     aiohttp_session = await acc._http._get_session()
 
@@ -117,14 +126,13 @@ async def main():
         anisette=anisette,
         dsid=dsid,
         username=apple_id,
-        pet_token=pet_token,
+        pet_token=pet_token, 
         mme_auth_token=mme_auth_token,
-        escrow_host=escrow_host,
+        escrow_host=escrow_host, # Use the correctly extracted host
     )
 
     try:
         print("Recovering MasterKey from escrow...")
-        # Pass the interactive password to the escrow client
         master_key_pem = await escrow_client.recover_master_key(password)
         print("Successfully recovered MasterKey.")
     except Exception as e:
@@ -152,7 +160,6 @@ async def main():
 
         kc = KeychainAccess(ck_session)
         kc.keystore["MasterKey"] = master_key_pem
-
         return kc.get_device_secrets()
 
     try:
@@ -161,7 +168,6 @@ async def main():
         print("---")
         print(f"Successfully fetched keychain. Found {len(keychain_items)} items.")
         for item in keychain_items:
-            # The final decrypted item is a plist (dict)
             print(f"- Item (acct: {item.get('acct')}, svce: {item.get('svce')})")
 
     except Exception as e:
