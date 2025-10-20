@@ -4,12 +4,15 @@ import logging
 import base64
 import uuid
 import time
-from typing import TypedDict, Dict, List, Optional, cast
+import plistlib
+import cbor2
+from typing import TypedDict, Dict, List, Optional, cast, Any
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import Prehashed 
 from cryptography.hazmat.primitives.serialization import load_der_public_key
+from miscreant.aes.siv import SIV
 
 # Import from our existing and new modules
 from . import cloudkit_pb2 as ckproto
@@ -18,6 +21,13 @@ from findmy.reports.anisette import BaseAnisetteProvider
 from findmy.errors import PushError
 from .cuttlefish_client import CuttlefishClient
 from findmy.reports.account import AsyncAppleAccount
+from . import crypto_util, asn1_defs
+from .constants import (
+    PCS_ZONE_PROTECTED_STORAGE, ZONE_MANATEE, ZONE_ENGRAM,
+    RECORD_TYPE_SYNCKEY, RECORD_TYPE_ITEM, RECORD_TYPE_CURRENT_ITEM,
+    FINDMY_DEVICE_SECRET_ACCOUNT, FINDMY_SERVICE_NAME,
+    CUTTLEFISH_ITEM_TYPE, CUTTLEFISH_PROTECTION_TAG
+)
 
 logger = logging.getLogger(__name__)
 
@@ -180,13 +190,11 @@ class KeychainClientState(TypedDict):
     adsid: str
     host: str
     state_token: Optional[str]
-    # Map of Peer ID Hash -> EncodedPeer object
     state: Dict[str, EncodedPeer]
     user_identity: Optional[KeychainUserIdentity]
-    # TODO: Add current_bottle, keystore, and items as we port them
-    # current_bottle: Optional[CurrentBottle]
-    # keystore: KeychainKeyStore
-    # items: Dict[str, SavedKeychainZone]
+    keystore: Dict[str, bytes]
+    keychain_items: Dict[str, Dict[str, ckproto.Record]]
+    sync_tokens: Dict[str, str]
 
 
 class KeychainClient:
@@ -197,21 +205,21 @@ class KeychainClient:
     def __init__(self,
                  initial_state: KeychainClientState,
                  anisette_provider: BaseAnisetteProvider,
-                 # --- ADD AsyncAppleAccount for access to CloudKitManager ---
                  account: AsyncAppleAccount,
-                 # os_config: YourOSConfigEquivalent # If needed later
                  ):
         self.state = initial_state
         self.anisette = anisette_provider
-        # --- Store account reference ---
         self.account = account # Needed to get CloudKitManager
-        # self.config = os_config
-        # --- Initialize CuttlefishClient ---
-        # We need CloudKitManager, access it via account
-        # We assume _get_cloudkit_manager() will be called externally
-        # before vouching starts, or lazily create it here.
-        # For simplicity, let's assume it's created lazily if needed.
         self._cuttlefish_client: Optional[CuttlefishClient] = None
+
+        self.state.setdefault('keystore', {})
+        self.state.setdefault('keychain_items', {
+            PCS_ZONE_PROTECTED_STORAGE: {},
+            ZONE_MANATEE: {},
+            ZONE_ENGRAM: {},
+            # Add other zones if needed
+        })
+        self.state.setdefault('sync_tokens', {})
 
         logger.info("KeychainClient initialized.")
 
@@ -599,5 +607,530 @@ class KeychainClient:
             # Consider reverting local state changes if join fails?
             raise
     # --- END join_with_voucher ---
+
+    def _get_field_value(self, record: ckproto.Record, field_name: str) -> Optional[ckproto.Record.Field.Value]:
+        """Helper to extract a value from a CloudKit protobuf record's 'fields' list."""
+        for field in record.record_field: # Note: field name is record_field
+            if field.identifier.name == field_name:
+                return field.value
+        return None
+
+    def _get_b64_field(self, record: ckproto.Record, field_name: str) -> Optional[bytes]:
+        """Helper for b64-encoded string fields (often used for bytes)."""
+        val = self._get_field_value(record, field_name)
+        # Bytes are often stored in string_value, base64 encoded
+        if val and val.HasField("string_value"):
+            try:
+                return base64.b64decode(val.string_value)
+            except (TypeError, ValueError):
+                logger.warning(f"Failed to base64 decode string_value for field '{field_name}'")
+                return None
+        # Sometimes raw bytes are used
+        elif val and val.HasField("bytes_value"):
+            return val.bytes_value
+        return None
+
+    def _get_string_field(self, record: ckproto.Record, field_name: str) -> Optional[str]:
+        """Helper for string fields."""
+        val = self._get_field_value(record, field_name)
+        if val and val.HasField("string_value"):
+            return val.string_value
+        return None
+
+    def _get_ref_field(self, record: ckproto.Record, field_name: str) -> Optional[ckproto.Record.Reference]:
+        """Helper for reference fields."""
+        val = self._get_field_value(record, field_name)
+        if val and val.HasField("reference_value"):
+            return val.reference_value
+        return None
+    
+    async def get_decrypted_key(self, key_id: str, zone_id: str = PCS_ZONE_PROTECTED_STORAGE) -> bytes:
+        """
+        Recursively fetches and decrypts a PCS key ('synckey' record),
+        returning its PEM-encoded private key. Caches results.
+        """
+        if key_id in self.state['keystore']:
+            return self.state['keystore'][key_id]
+
+        logger.info(f"Decrypting key: {key_id} in zone {zone_id}...")
+
+        # 1. Fetch the raw 'synckey' record from CloudKit (using CloudKitManager)
+        # We need the CloudKitManager for this, not CuttlefishClient
+        ck_manager = await self.account._get_cloudkit_manager() # Use the getter
+
+        # Construct RecordIdentifier
+        record_identifier = ckproto.RecordIdentifier()
+        record_identifier.value.name = key_id
+        record_identifier.zone_identifier.value.name = zone_id
+        # Assuming ownerIdentifier is needed if not _PCS zone, might need adjustment
+        if zone_id != PCS_ZONE_PROTECTED_STORAGE:
+            record_identifier.zone_identifier.owner_identifier.name = f"_{ck_manager.user_id}"
+
+        # Build RecordRetrieveRequest (this uses a different endpoint than function invoke)
+        # This part requires adding a record retrieve method to CloudKitManager,
+        # OR potentially finding keys via Cuttlefish fetchChanges if they sync there.
+        # For now, let's *assume* the key records are synced via fetchChanges
+        # and are available in self.state['keychain_items'].
+
+        key_record = self.state['keychain_items'].get(zone_id, {}).get(key_id)
+        if not key_record:
+            # If not found after sync, try fetching directly (Requires CloudKitManager changes)
+            logger.warning(f"Key record {key_id} not found in synced items for zone {zone_id}. Direct fetch not implemented.")
+            raise PushError(f"PCS key not found after sync: {key_id}")
+
+        if key_record.type.name != RECORD_TYPE_SYNCKEY:
+            raise PushError(f"Record {key_id} is not a {RECORD_TYPE_SYNCKEY}")
+
+        # 2. Get its wrapped key and parent key reference
+        wrapped_key = self._get_b64_field(key_record, "wrappedKey")
+        parent_ref = self._get_ref_field(key_record, "parentKeyRef")
+
+        if not wrapped_key or not parent_ref:
+            # If a key has no parent, it might be a TLK decrypted via shares
+            if key_id in self.state['keystore']: # Check if fetched via shares earlier
+                logger.debug(f"Key {key_id} has no parent, using pre-loaded key from keystore.")
+                return self.state['keystore'][key_id]
+            else:
+                raise PushError(f"Key {key_id} has no parent reference and is not pre-loaded.")
+
+        # Ensure parent_ref has necessary fields
+        if not parent_ref.record_identifier or not parent_ref.record_identifier.value or not parent_ref.zone_identifier or not parent_ref.zone_identifier.value:
+            raise PushError(f"Parent reference for key {key_id} is incomplete.")
+
+        parent_key_id = parent_ref.record_identifier.value.name
+        parent_zone_id = parent_ref.zone_identifier.value.name
+
+        # 3. Recursively get the parent's private key (PEM)
+        parent_private_key_pem = await self.get_decrypted_key(parent_key_id, parent_zone_id)
+
+        # 4. Unwrap the key using RFC 6637
+        # We need a fingerprint - the Rust code uses "fingerprint", let's assume that for now.
+        fingerprint = b"fingerprint" # Placeholder, might need adjustment
+        unwrapped_key_data = crypto_util.rfc6637_unwrap_key(
+            parent_private_key_pem,
+            wrapped_key,
+            fingerprint
+        )
+
+        # 5. The unwrapped data is an ASN.1-encoded PCSPrivateKey
+        pcs_key_struct = asn1_defs.PCSPrivateKey.load(unwrapped_key_data)
+
+        # 6. Extract the actual private key (PKCS#8 DER)
+        private_key_info_der = pcs_key_struct['privateKeyInfo'].dump() # Get DER bytes
+
+        # 7. Convert DER to PEM format for storage/use
+        # Use cryptography library for proper PEM encoding
+        private_key_obj = serialization.load_der_private_key(private_key_info_der, password=None)
+        key_pem_bytes = private_key_obj.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption()
+        )
+
+        logger.info(f"Successfully decrypted key: {key_id}")
+        self.state['keystore'][key_id] = key_pem_bytes
+        # NOTE: External persistence of self.state assumed elsewhere
+        return key_pem_bytes
+    
+
+    def _build_aad_v2(self, item_uuid_str: str, record: ckproto.Record) -> bytes:
+        """
+        Builds the Additional Authenticated Data (AAD) for Cuttlefish v2 (AES-SIV) decryption.
+        """
+        try:
+            item_uuid_bytes = uuid.UUID(item_uuid_str).bytes
+            item_type = CUTTLEFISH_ITEM_TYPE # b"item"
+            protection_tag = CUTTLEFISH_PROTECTION_TAG # b"user"
+
+            # 'data' field is a b64 encoded plist containing metadata
+            data_plist_bytes = self._get_b64_field(record, "data")
+            if not data_plist_bytes:
+                raise ValueError("Item missing 'data' field required for AAD")
+            data_plist = plistlib.loads(data_plist_bytes)
+
+            # Extract ctime and mtime (creation/modification timestamps)
+            # Protobuf might store these differently than the old code expected
+            # Check the actual structure if errors occur. Assume they are ints for now.
+            ctime = data_plist.get('ctime', 0)
+            mtime = data_plist.get('mtime', 0)
+            if not isinstance(ctime, int) or not isinstance(mtime, int):
+                logger.warning(f"Unexpected type for ctime/mtime in item {item_uuid_str}. Using 0.")
+                ctime = mtime = 0
+
+            # AAD components: UUID, Item Type, Protection Tag, ctime, mtime
+            # Order matters! Encoded using CBOR.
+            aad_components = [item_uuid_bytes, item_type, protection_tag, ctime, mtime]
+            return cbor2.dumps(aad_components)
+        except Exception as e:
+            logger.error(f"Error building AAD for {item_uuid_str}: {e}")
+            raise PushError(f"Failed to build AAD for item {item_uuid_str}") from e
+
+
+    async def decrypt_keychain_item(self, item_uuid: str, record: ckproto.Record) -> Optional[Dict[str, Any]]:
+        """
+        Decrypts a 'item' record (CuttlefishEncItem, encver=2) using AES-SIV.
+        """
+        logger.info(f"Attempting decryption for keychain item: {item_uuid}")
+        try:
+            # 1. Parse the 'data' field (b64 plist) to check encver and get encrypted payload
+            data_plist_bytes = self._get_b64_field(record, "data")
+            if not data_plist_bytes:
+                raise ValueError("Item record missing 'data' field")
+            data_plist = plistlib.loads(data_plist_bytes)
+
+            encver = data_plist.get('encver')
+            if encver != 2:
+                logger.warning(f"Skipping item {item_uuid}: Unsupported encryption version {encver} (only v2/AES-SIV supported).")
+                return None
+
+            # 2. Get the item's wrapped key and its parent key reference
+            wrapped_item_data_key = self._get_b64_field(record, "wrappedKey")
+            parent_ref = self._get_ref_field(record, "parentKeyRef")
+
+            if not wrapped_item_data_key or not parent_ref:
+                raise ValueError("Item missing wrappedKey or parentKeyRef")
+            if not parent_ref.record_identifier or not parent_ref.record_identifier.value or not parent_ref.zone_identifier or not parent_ref.zone_identifier.value:
+                raise ValueError("Item parent reference is incomplete")
+
+            parent_key_id = parent_ref.record_identifier.value.name
+            parent_zone_id = parent_ref.zone_identifier.value.name
+
+            # 3. Get the parent key (PEM) by recursively decrypting if needed
+            unwrapping_key_pem = await self.get_decrypted_key(parent_key_id, parent_zone_id)
+
+            # 4. Unwrap the item's specific data key using RFC 6637
+            # Assume same fingerprint as key unwrapping
+            item_data_key = crypto_util.rfc6637_unwrap_key(
+                unwrapping_key_pem,
+                wrapped_item_data_key,
+                b"fingerprint" # Placeholder
+            )
+
+            # 5. Get the encrypted payload (v_Data) from the data plist
+            encrypted_payload = data_plist.get('v_Data')
+            if not isinstance(encrypted_payload, bytes):
+                # Plist library decodes <data> tags into bytes
+                raise ValueError("Item data plist missing 'v_Data' or not bytes")
+
+            # 6. Build the AAD
+            aad = self._build_aad_v2(item_uuid, record)
+
+            # 7. Decrypt using AES-SIV
+            siv = SIV(item_data_key) # Key needs to be 32 or 64 bytes for AES-SIV
+            # Ensure item_data_key length is correct (likely 32 bytes for AES-256-SIV)
+            if len(item_data_key) not in [32, 64]:
+                raise ValueError(f"Invalid key size for AES-SIV: {len(item_data_key)}")
+
+            decrypted_payload = siv.open(encrypted_payload, [aad]) # AAD must be a list of bytes
+            if decrypted_payload is None:
+                raise PushError("AES-SIV decryption failed (authentication error)")
+
+            # 8. The decrypted data is another plist containing the secret
+            final_plist = plistlib.loads(decrypted_payload)
+            logger.info(f"Successfully decrypted item: {item_uuid}")
+            return cast(Dict[str, Any], final_plist)
+
+        except Exception as e:
+            logger.error(f"Failed to decrypt item {item_uuid}: {e}")
+            # Optionally re-raise specific errors if needed
+            return None
+
+    async def fetch_tlk_shares(self) -> List[ckproto.CuttlefishRecoverableTlkShare]:
+        """Fetches recoverable TLK shares for the current user identity."""
+        identity = await self.ensure_user_identity()
+        if not identity:
+            raise InvalidStateError("Cannot fetch TLK shares without user identity")
+
+        logger.info(f"Fetching recoverable TLK shares for peer: {identity.identifier}")
+        cuttlefish = await self._get_cuttlefish_client()
+        request = ckproto.CuttlefishFetchRecoverableTlkSharesRequest(for_peer=identity.identifier)
+
+        try:
+            response = await cuttlefish.fetch_recoverable_tlk_shares(request)
+            logger.info(f"Fetched {len(response.shares)} TLK shares.")
+            return list(response.shares) # Convert repeated field to list
+        except PushError as e:
+            logger.error(f"Failed to fetch TLK shares: {e}")
+            raise PushError("Could not fetch TLK shares") from e
+
+    async def store_tlk_shares(self, shares: List[ckproto.CuttlefishRecoverableTlkShare]):
+        """Decrypts and stores TLK shares in the keystore."""
+        identity = await self.ensure_user_identity()
+        if not identity:
+            raise InvalidStateError("Cannot store TLK shares without user identity")
+
+        logger.info(f"Processing {len(shares)} fetched TLK shares...")
+        keys_added = 0
+        for share_container in shares:
+            try:
+                # Basic validation
+                if not share_container.HasField("share") or not share_container.share.HasField("inner"):
+                    logger.warning("Skipping share container missing inner record.")
+                    continue
+                share_record = share_container.share.inner
+                item = CuttlefishTlkShare.from_record(share_record.record_field) # Assuming helper
+
+                # TODO: Verify share signature using sender's key (requires fetching sender peer)
+                # sender_peer = self.state['state'].get(item.sender)
+                # if sender_peer:
+                #     sender_signing_key = load_der_public_key(sender_peer.get_permanent_info().signing_key)
+                #     # Verify item.signature against item.data_for_signing() using sender_signing_key
+                # else:
+                #     logger.warning(f"Sender peer {item.sender} not found for TLK share verification.")
+                #     continue # Skip unverifiable share
+
+                # Decrypt the wrapped key using our identity's encryption key
+                wrapped_key_b64 = item.wrappedkey # Assuming this is b64 string
+                if not wrapped_key_b64:
+                    logger.warning("Skipping TLK share with empty wrapped key.")
+                    continue
+                wrapped_key_plist_bytes = base64.b64decode(wrapped_key_b64)
+
+                # The wrapped key is a KeyedArchive plist containing IESCiphertext
+                key_archive_dict = plistlib.loads(wrapped_key_plist_bytes) # Use loads for bytes
+                # We need to manually parse the IESCiphertext structure from the dict
+                # This requires knowing the exact keys used in the plist (e.g., 'SFCiphertext')
+                # For now, assume a helper function or direct dict access:
+                ciphertext = key_archive_dict.get('SFCiphertext')
+                auth_code = key_archive_dict.get('SFIESAuthenticationCode')
+                eph_key_data = key_archive_dict.get('SFEphemeralSenderPublicKeyExternaRepresentation', {}).get('$objects', [{}])[1].get('NS.data') # Example deep access
+
+                if not ciphertext or not auth_code or not eph_key_data:
+                    logger.warning(f"Skipping TLK share {item_uuid}: Malformed IESCiphertext plist.")
+                    continue
+
+                # Reconstruct IESCiphertext (or decrypt directly)
+                # This needs the IESCiphertext class or equivalent logic from keychain.rs
+                # Placeholder: Use a simplified decryption call assuming a helper exists
+                # decrypted_key_proto_bytes = decrypt_ies(identity._encryption_key, ...)
+                # For now, we cannot proceed without the IES decryption logic.
+
+                # --- TEMPORARY Placeholder ---
+                # Assume decryption succeeds and yields the CuttlefishSerializedKey bytes
+                # In reality, you need to implement IES decryption here.
+                logger.warning(f"IES decryption for TLK share {item.key_id} not fully implemented.")
+                continue # Skip until IES is done
+                # --- End Placeholder ---
+
+                # If decryption worked:
+                # decrypted_key_proto = ckproto.CuttlefishSerializedKey()
+                # decrypted_key_proto.ParseFromString(decrypted_key_proto_bytes)
+                # key_id = decrypted_key_proto.uuid
+                # key_pem = convert_serialized_key_to_pem(decrypted_key_proto) # Need conversion helper
+                # self.state['keystore'][key_id] = key_pem
+                # keys_added += 1
+
+            except Exception as e:
+                item_uuid = share_container.share.inner.record_identifier.value.name if share_container.HasField("share") else "Unknown"
+                logger.error(f"Failed to process TLK share {item_uuid}: {e}")
+
+        logger.info(f"Stored {keys_added} decrypted TLKs in keystore.")
+        # NOTE: External persistence assumed elsewhere
+
+    async def sync_keychain_zone(self, zone_name: str, full_resync: bool = False):
+        """Fetches changes for a specific keychain zone using CloudKitManager."""
+        logger.info(f"Syncing keychain zone: {zone_name} (Full Resync: {full_resync})...")
+        ck_manager = await self.account._get_cloudkit_manager()
+
+        current_sync_token = None if full_resync else self.state.get('sync_tokens', {}).get(zone_name)
+        zone_items = self.state['keychain_items'].setdefault(zone_name, {}) # Get or create zone dict
+
+        if full_resync:
+             logger.info(f"Performing full resync for zone {zone_name}, clearing local items.")
+             zone_items.clear()
+             current_sync_token = None # Ensure token is None for full sync
+
+        more_coming = True # Assume potentially more initially
+        new_sync_token = current_sync_token # Start with current token
+        page_count = 0
+        changes_processed = 0
+
+        while more_coming:
+            page_count += 1
+            logger.debug(f"Fetching page {page_count} for zone {zone_name}...")
+            more_coming = False # Reset for this page fetch
+            try:
+                # Use the new async generator method
+                async for changes_resp in ck_manager.fetch_record_zone_changes(
+                    zone_name=zone_name,
+                    sync_token=current_sync_token
+                    # database_scope can be specified if not PRIVATE_DB
+                ):
+                    # Process changes in the response
+                    if not changes_resp.HasField("changes_by_record_type"):
+                         logger.debug("No changes in this response page.")
+                         # Update token even if no changes on this specific page
+                         new_sync_token = changes_resp.sync_token
+                         more_coming = changes_resp.more_coming # Check if server indicates more
+                         current_sync_token = new_sync_token # Use new token for next request
+                         break # Exit inner loop for this page
+
+                    for change in changes_resp.changes_by_record_type: # Iterate through RecordZoneChanges
+                         record = change.record # The actual Record protobuf
+                         record_name = record.record_identifier.value.name
+
+                         if change.type == ckproto.RecordZoneChangesResponse.Change.DELETE:
+                              removed = zone_items.pop(record_name, None)
+                              if removed:
+                                   logger.debug(f"Deleted record {record_name} from zone {zone_name}.")
+                                   changes_processed += 1
+                         else: # CREATE or UPDATE
+                              zone_items[record_name] = record
+                              logger.debug(f"Created/Updated record {record_name} in zone {zone_name}.")
+                              changes_processed += 1
+
+                    # Update sync token and pagination flag after processing the page
+                    new_sync_token = changes_resp.sync_token
+                    more_coming = changes_resp.more_coming
+                    current_sync_token = new_sync_token # Use new token for the next request
+
+                    if not more_coming:
+                        logger.debug(f"No more changes indicated by server for zone {zone_name}.")
+                        break # Exit the async for loop (generator)
+
+                # After processing all pages from the generator (or breaking early)
+                break # Exit the outer while loop if not more_coming
+
+            except PushError as e:
+                # Handle specific errors like token expiry
+                if "changeTokenExpired" in str(e):
+                    logger.warning(f"Change token expired during sync for zone {zone_name}. Retrying with full resync.")
+                    # Clear local state and token, then retry the while loop
+                    zone_items.clear()
+                    current_sync_token = None
+                    new_sync_token = None
+                    more_coming = True # Force retry
+                    page_count = 0 # Reset page count
+                    changes_processed = 0
+                    continue # Retry the while loop
+                else:
+                    logger.error(f"Sync failed for zone {zone_name}: {e}")
+                    raise # Re-raise other push errors
+            except Exception as e:
+                 logger.error(f"Unexpected error during zone sync {zone_name}: {e}", exc_info=True)
+                 raise PushError(f"Unexpected failure syncing zone {zone_name}") from e
+
+        # Final update of sync token after loop finishes
+        if new_sync_token:
+            self.state.setdefault('sync_tokens', {})[zone_name] = new_sync_token
+            logger.debug(f"Final sync token for zone {zone_name}: {new_sync_token}")
+        else:
+             # If sync failed or was interrupted, might want to remove the token
+             self.state.get('sync_tokens', {}).pop(zone_name, None)
+             logger.warning(f"No final sync token obtained for zone {zone_name}.")
+
+
+        logger.info(f"Sync complete for zone {zone_name}. Processed {changes_processed} changes across {page_count} page(s).")
+        # NOTE: External persistence of self.state assumed elsewhere
+
+    async def get_device_secrets(self) -> List[Dict[str, Any]]:
+        """
+        Main method to sync keychain and decrypt FindMy device secrets.
+        Assumes the client has successfully joined the circle (e.g., via vouching).
+        """
+        logger.info("Starting process to fetch Find My device secrets...")
+        identity = await self.ensure_user_identity()
+        if not identity:
+            raise InvalidStateError("Cannot get secrets without user identity")
+        if identity.identifier not in identity.current_state.includeds:
+            # We need to be part of the circle first
+            raise InvalidStateError("Cannot get secrets: Not currently included in the keychain circle. Join first.")
+
+        # 1. Ensure TLKs are available (fetch if needed)
+        # Check if any TLKs are already in the keystore
+        has_tlks = any(k.startswith("TLK:") for k in self.state['keystore']) # Assuming TLK IDs start with TLK:
+        if not has_tlks:
+            logger.info("No TLKs found in keystore, fetching shares...")
+            try:
+                shares = await self.fetch_tlk_shares()
+                await self.store_tlk_shares(shares) # This needs IES decryption implemented
+                has_tlks = any(k.startswith("TLK:") for k in self.state['keystore'])
+                if not has_tlks:
+                    logger.warning("Failed to store TLKs after fetching shares (IES decryption likely missing).")
+                    # Cannot proceed without TLKs
+                    raise PushError("Could not obtain TLKs.")
+            except PushError as e:
+                logger.error(f"Failed to fetch or store TLKs: {e}")
+                raise
+
+        # 2. Sync required zones (_PCS for keys, Manatee for items)
+        # These need the CloudKitManager record fetching to be implemented
+        logger.info("Syncing required keychain zones...")
+        try:
+            await self.sync_keychain_zone(PCS_ZONE_PROTECTED_STORAGE)
+            await self.sync_keychain_zone(ZONE_MANATEE)
+        except PushError as e:
+            logger.error(f"Zone sync failed: {e}. Cannot proceed.")
+            raise
+
+        # 3. Find the FindMy service key record in _PCS
+        logger.info(f"Searching for FindMy service key ({FINDMY_SERVICE_NAME}) in {PCS_ZONE_PROTECTED_STORAGE} zone...")
+        findmy_service_key_id = None
+        findmy_service_key_record = None
+        pcs_items = self.state['keychain_items'].get(PCS_ZONE_PROTECTED_STORAGE, {})
+        for item_id, record in pcs_items.items():
+            if record.type.name != RECORD_TYPE_SYNCKEY:
+                continue
+            service_name = self._get_string_field(record, "service")
+            if service_name == FINDMY_SERVICE_NAME:
+                findmy_service_key_id = item_id
+                findmy_service_key_record = record
+                logger.info(f"Found FindMy service key record: {findmy_service_key_id}")
+                break
+
+        if not findmy_service_key_id or not findmy_service_key_record:
+            logger.error(f"FindMy service key ({FINDMY_SERVICE_NAME}) not found in {PCS_ZONE_PROTECTED_STORAGE} zone after sync.")
+            raise PushError("FindMy service key not found.")
+
+        # 4. Decrypt the FindMy service key (will use cached/decrypted TLK)
+        logger.info(f"Decrypting FindMy service key: {findmy_service_key_id}...")
+        try:
+            # This call recursively handles decryption back to the TLK
+            _ = await self.get_decrypted_key(findmy_service_key_id, PCS_ZONE_PROTECTED_STORAGE)
+            # Result is cached in self.state['keystore']
+            logger.info("Successfully decrypted and cached FindMy service key.")
+        except Exception as e:
+            logger.error(f"Failed to decrypt FindMy service key: {e}")
+            raise PushError("Could not decrypt FindMy service key") from e
+
+        # 5. Find and decrypt FindMy secrets in Manatee zone
+        logger.info(f"Searching for FindMy secrets ({FINDMY_DEVICE_SECRET_ACCOUNT}) in {ZONE_MANATEE} zone...")
+        secrets: List[Dict[str, Any]] = []
+        manatee_items = self.state['keychain_items'].get(ZONE_MANATEE, {})
+        for item_uuid, record in manatee_items.items():
+            if record.type.name != RECORD_TYPE_ITEM:
+                continue
+
+            try:
+                # Check the 'acct' field inside the 'data' plist
+                data_plist_bytes = self._get_b64_field(record, "data")
+                if not data_plist_bytes: continue
+                data_plist = plistlib.loads(data_plist_bytes)
+                account_name = data_plist.get('acct')
+
+                if account_name == FINDMY_DEVICE_SECRET_ACCOUNT:
+                    logger.debug(f"Found potential secret item: {item_uuid}")
+                    # Check if it's chained to our FindMy service key
+                    parent_ref = self._get_ref_field(record, "parentKeyRef")
+                    if parent_ref and parent_ref.record_identifier and parent_ref.record_identifier.value and \
+                    parent_ref.record_identifier.value.name == findmy_service_key_id:
+
+                        logger.info(f"Decrypting FindMy secret item: {item_uuid}")
+                        decrypted_item_plist = await self.decrypt_keychain_item(item_uuid, record)
+                        if decrypted_item_plist:
+                            # Add identifier for context
+                            decrypted_item_plist['_uuid'] = item_uuid
+                            secrets.append(decrypted_item_plist)
+                        else:
+                            logger.warning(f"Decryption failed for item {item_uuid}.")
+                    else:
+                        parent_id = parent_ref.record_identifier.value.name if parent_ref and parent_ref.record_identifier and parent_ref.record_identifier.value else "None"
+                        logger.debug(f"Skipping item {item_uuid}: Parent key ({parent_id}) is not the FindMy service key ({findmy_service_key_id}).")
+
+            except Exception as e:
+                logger.error(f"Error processing Manatee item {item_uuid}: {e}")
+
+        logger.info(f"Finished processing. Found {len(secrets)} decrypted FindMy secrets.")
+        return secrets
 
 # --- End of findmy/keychain/client.py ---

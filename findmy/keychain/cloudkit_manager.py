@@ -3,12 +3,11 @@ import base64
 import logging
 import time
 import uuid
-from typing import Any, Optional, Type, TYPE_CHECKING, TypeVar, cast
+from typing import Any, Optional, Type, TYPE_CHECKING, TypeVar, cast, AsyncGenerator
 
 from google.protobuf.message import Message
 
 from findmy.errors import PushError, UnhandledProtocolError, InvalidStateError
-# *** Import your actual HttpResponse class ***
 from findmy.util.http import HttpSession, HttpResponse
 from . import cloudkit_pb2 as ckproto
 
@@ -280,3 +279,176 @@ class CloudKitManager:
         except Exception as e:
            logger.error(f"Cuttlefish method {method} failed during HTTP/parsing: {e}")
            raise PushError(f"Cuttlefish:{method} failed") from e
+        
+    async def fetch_record_zone_changes(
+        self,
+        zone_name: str,
+        sync_token: Optional[str] = None,
+        database_scope: ckproto.RequestOperation.Header.DatabaseScope = ckproto.RequestOperation.Header.PRIVATE_DB,
+    ) -> AsyncGenerator[ckproto.RecordZoneChangesResponse, None]:
+        """
+        Fetches record changes for a specific zone using FetchRecordZoneChangesOperation.
+        Yields RecordZoneChangesResponse pages.
+        """
+        await self._ensure_initialized()
+        if not self.ck_token:
+            raise PushError("Cannot fetch records without CloudKit token.")
+
+        logger.info(f"Fetching record changes for zone: {zone_name} (Scope: {database_scope.name})")
+
+        more_coming = True
+        current_sync_token = sync_token
+
+        while more_coming:
+            operation_uuid = str(uuid.uuid4()).upper()
+
+            # 1. Build RequestOperation
+            req_op = ckproto.RequestOperation()
+            # Set Header (similar to invoke_cuttlefish, adjust scope)
+            req_op.header.application_container = CUTTLEFISH_CONTAINER_ID # Assuming same container
+            req_op.header.application_bundle = CUTTLEFISH_BUNDLE_ID   # Assuming same bundle
+            req_op.header.target_database = database_scope
+            req_op.header.application_container_environment = ckproto.RequestOperation.Header.PRODUCTION
+            # Header user_token is often empty
+
+            # Set Request Body
+            req_op.request.operation_uuid = operation_uuid
+            req_op.request.type = ckproto.Operation.RECORD_ZONE_CHANGES_TYPE # Type 307
+
+            # Create and populate RecordZoneChangesRequest
+            changes_req = ckproto.RecordZoneChangesRequest()
+            # Set Zone Identifier
+            changes_req.zone_identifier.value.name = zone_name
+            # Set Owner Identifier if needed (typically for non-_PCS private zones)
+            if database_scope == ckproto.RequestOperation.Header.PRIVATE_DB and zone_name != PCS_ZONE_PROTECTED_STORAGE:
+                 changes_req.zone_identifier.owner_identifier.name = f"_{self.user_id}" # Use fetched CloudKit User ID
+
+            if current_sync_token:
+                changes_req.sync_token = current_sync_token
+            # Set desired keys if needed (optional optimization)
+            # changes_req.desired_keys.extend(["field1", "field2"])
+            changes_req.num_results = 100 # Request a reasonable number of results per page
+
+            # Assign to the RequestOperation
+            req_op.record_zone_changes_request.CopyFrom(changes_req)
+
+            # 2. Serialize and Delimit
+            encoded_op = req_op.SerializeToString()
+
+            def encode_uleb128(value: int) -> bytes: # Simple ULEB128 encoder
+                result = bytearray()
+                while True:
+                    byte = value & 0x7F
+                    value >>= 7
+                    if value == 0:
+                        result.append(byte); return bytes(result)
+                    result.append(byte | 0x80)
+
+            delimited_request_body = encode_uleb128(len(encoded_op)) + encoded_op
+
+            # 3. Determine Endpoint and Headers
+            # Record operations usually use the /database/1/... endpoint
+            db_scope_str = "private" if database_scope == ckproto.RequestOperation.Header.PRIVATE_DB else \
+                           "public" if database_scope == ckproto.RequestOperation.Header.PUBLIC_DB else \
+                           "shared" # Adjust if other scopes used
+            invoke_url = f"https://gateway.icloud.com/database/1/{CUTTLEFISH_CONTAINER_ID}/{db_scope_str}/records/changes"
+
+            http_headers = {
+                "Content-Type" : 'application/x-protobuf; desc="https://gateway.icloud.com:443/static/protobuf/CloudDB/CloudDBClient.desc"; messageType=RequestOperation; delimited=true',
+                "Accept" : "application/x-protobuf",
+                "X-CloudKit-AuthToken" : self.ck_token,
+                "X-CloudKit-UserId" : self.user_id,
+                "X-CloudKit-ContainerId" : CUTTLEFISH_CONTAINER_ID,
+                "X-CloudKit-BundleId" : CUTTLEFISH_BUNDLE_ID,
+                "X-CloudKit-DatabaseScope": db_scope_str.capitalize(), # "Private", "Public", etc.
+                **(await self.anisette.get_headers(self.account._uid, self.account._devid)),
+                "X-Apple-Request-UUID" : operation_uuid, # Use same UUID as operation
+            }
+
+            # 4. Send Request and Handle Response/Retry
+            try:
+                response: HttpResponse = await self.http.post(
+                    invoke_url,
+                    headers=http_headers,
+                    data=delimited_request_body
+                )
+
+                if not response.ok:
+                    if response.status_code == 401:
+                        logger.warning("CloudKit token likely expired fetching changes, attempting refresh.")
+                        await self._refresh_ck_token()
+                        # Retry the request once after refresh
+                        http_headers["X-CloudKit-AuthToken"] = self.ck_token
+                        response = await self.http.post(invoke_url, headers=http_headers, data=delimited_request_body)
+                        if not response.ok:
+                            raise PushError(f"Record fetch failed ({response.status_code}) for zone {zone_name} after token refresh")
+                    elif response.status_code == 421: # Change token expired
+                         # Let the caller handle this specific error type if needed
+                         logger.warning(f"CloudKit reported change token expired for zone {zone_name}. Need full resync.")
+                         raise PushError(f"changeTokenExpired:{zone_name}") # Signal specific error
+                    else:
+                        response_text = response.text() # Sync text()
+                        logger.error(f"Record fetch HTTP error: {response.status_code} for zone {zone_name}")
+                        logger.error(f"Response: {response_text[:500]}")
+                        raise PushError(f"Record fetch HTTP error ({response.status_code}) for zone {zone_name}")
+
+                # 5. Parse Delimited Response
+                response_body = response.content # Sync content
+
+                def decode_uleb128(data: bytes) -> tuple[int, int]: # Simple ULEB128 decoder
+                    result, shift, idx = 0, 0, 0
+                    while True:
+                        if idx >= len(data): raise ValueError("Malformed ULEB128")
+                        byte = data[idx]; idx += 1
+                        result |= (byte & 0x7F) << shift
+                        if (byte & 0x80) == 0: return result, idx
+                        shift += 7
+
+                resp_ops = []
+                offset = 0
+                while offset < len(response_body):
+                   length, len_bytes_read = decode_uleb128(response_body[offset:])
+                   offset += len_bytes_read
+                   op_data = response_body[offset : offset + length]
+                   offset += length
+                   resp_op = ckproto.ResponseOperation()
+                   resp_op.ParseFromString(op_data)
+                   resp_ops.append(resp_op)
+
+                # 6. Find Matching Response and Extract Data
+                target_resp = next((op for op in resp_ops if op.response.operation_uuid == operation_uuid), None)
+                if not target_resp:
+                    raise UnhandledProtocolError(f"CloudKit response missing operation UUID match for zone {zone_name}.")
+
+                if target_resp.result.code != ckproto.ResponseOperation.Result.SUCCESS:
+                    error_info = target_resp.result.error
+                    err_code = error_info.client_error.type if error_info.HasField("client_error") else error_info.server_error.type
+                    err_reason = error_info.reason
+                    logger.error(f"CloudKit reported error fetching changes for zone {zone_name}: Code={err_code}, Reason='{err_reason}'")
+                    # Check for specific errors like 'changeTokenExpired' if needed
+                    if err_reason == "changeTokenExpired":
+                         raise PushError(f"changeTokenExpired:{zone_name}")
+                    raise PushError(f"CloudKit error ({err_code}) fetching changes for {zone_name}: {err_reason}")
+
+                # Extract the actual changes response
+                changes_resp = target_resp.record_zone_changes_response
+                if not changes_resp: # Should always be present on success
+                     raise UnhandledProtocolError(f"Missing RecordZoneChangesResponse in successful CloudKit response for zone {zone_name}.")
+
+                # 7. Yield the response page
+                yield changes_resp
+
+                # 8. Update for next loop iteration
+                more_coming = changes_resp.more_coming
+                current_sync_token = changes_resp.sync_token
+                if more_coming:
+                     logger.debug(f"More changes coming for zone {zone_name}, continuing fetch...")
+                else:
+                     logger.debug(f"Finished fetching changes for zone {zone_name}.")
+
+            except PushError as e:
+                 # Re-raise PushErrors to propagate them (like changeTokenExpired)
+                 raise
+            except Exception as e:
+                logger.error(f"Record fetch for zone {zone_name} failed during HTTP/parsing: {e}", exc_info=True)
+                raise PushError(f"Record fetch failed for zone {zone_name}") from e
