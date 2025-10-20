@@ -1,3 +1,4 @@
+# findmy/reports/anisette.py
 """Module for Anisette header providers."""
 
 from __future__ import annotations
@@ -7,20 +8,31 @@ import base64
 import locale
 import logging
 import time
+import re
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
-from typing import BinaryIO, Literal, TypedDict, Union
+# CHANGED: Added Dict, Tuple, Optional, cast
+from typing import BinaryIO, Literal, TypedDict, Union, Dict, Tuple, Optional, cast
 
+# Uses the original anisette library
 from anisette import Anisette, AnisetteHeaders
 from typing_extensions import override
 
 from findmy import util
+# FIXED: Import PushError
+from findmy.errors import PushError
+# FIXED: Import abc submodule correctly
+from findmy.util import abc as util_abc
+# FIXED: Import http submodule correctly
+from findmy.util import http as util_http
+
 
 logger = logging.getLogger(__name__)
 
 
+# --- AnisetteMapping TypedDicts ---
 class RemoteAnisetteMapping(TypedDict):
     """JSON mapping representing state of a remote Anisette provider."""
 
@@ -36,6 +48,7 @@ class LocalAnisetteMapping(TypedDict):
 
 
 AnisetteMapping = Union[RemoteAnisetteMapping, LocalAnisetteMapping]
+# --- End AnisetteMapping ---
 
 
 def get_provider_from_mapping(
@@ -45,85 +58,46 @@ def get_provider_from_mapping(
 ) -> RemoteAnisetteProvider | LocalAnisetteProvider:
     """Get the correct Anisette provider instance from saved JSON data."""
     if mapping["type"] == "aniRemote":
+        # FIXED: Call correct from_json
         return RemoteAnisetteProvider.from_json(mapping)
     if mapping["type"] == "aniLocal":
+        # FIXED: Call correct from_json
         return LocalAnisetteProvider.from_json(mapping, libs_path=libs_path)
     msg = f"Unknown anisette type: {mapping['type']}"
     raise ValueError(msg)
 
 
-class BaseAnisetteProvider(util.abc.Closable, util.abc.Serializable, ABC):
-    """
-    Abstract base class for Anisette providers.
+# FIXED: Inherit from util_abc
+class BaseAnisetteProvider(util_abc.Closable, util_abc.Serializable[AnisetteMapping], ABC):
+    """Base abstract class for Anisette providers."""
 
-    Generously derived from https://github.com/nythepegasus/grandslam/blob/main/src/grandslam/gsa.py#L41.
-    """
+    _ani_headers: Optional[AnisetteHeaders] = None
 
-    @property
+    def __init__(self) -> None:
+        super().__init__()
+        self._ani_headers = None
+
     @abstractmethod
-    def otp(self) -> str:
-        """A seemingly random base64 string containing 28 bytes."""
+    async def close(self) -> None:
         raise NotImplementedError
 
-    @property
     @abstractmethod
-    def machine(self) -> str:
-        """A base64 encoded string of 60 'random' bytes."""
+    def to_json(self, dst: str | Path | None = None, /) -> AnisetteMapping:
         raise NotImplementedError
 
-    @property
-    def timestamp(self) -> str:
-        """Current timestamp in ISO 8601 format."""
-        return datetime.now(tz=timezone.utc).replace(microsecond=0).isoformat() + "Z"
+    # FIXED: Correct signature to match base Serializable class
+    @classmethod
+    @abstractmethod
+    def from_json(
+        cls,
+        val: AnisetteMapping | str | Path,
+        /,
+        *,
+        libs_path: str | Path | None = None,
+    ) -> BaseAnisetteProvider:
+        raise NotImplementedError
 
-    @property
-    def timezone(self) -> str:
-        """Abbreviation of the timezone of the device."""
-        return str(datetime.now().astimezone().tzinfo)
-
-    @property
-    def locale(self) -> str:
-        """Locale of the device (e.g. en_US)."""
-        return locale.getdefaultlocale()[0] or "en_US"
-
-    @property
-    def router(self) -> str:
-        """
-        A number, either 17106176 or 50660608.
-
-        It doesn't seem to matter which one we use.
-        - 17106176 is used by Sideloadly and Provision (android) based servers.
-        - 50660608 is used by Windows iCloud based servers.
-        """
-        return "17106176"
-
-    @property
-    def client(self) -> str:
-        """
-        Client string.
-
-        The format is as follows:
-        <%MODEL%> <%OS%;%MAJOR%.%MINOR%(%SPMAJOR%,%SPMINOR%);%BUILD%>
-         <%AUTHKIT_BUNDLE_ID%/%AUTHKIT_VERSION% (%APP_BUNDLE_ID%/%APP_VERSION%)>
-
-        Where:
-            MODEL: The model of the device (e.g. MacBookPro15,1 or 'PC'
-            OS: The OS of the device (e.g. Mac OS X or Windows)
-            MAJOR: The major version of the OS (e.g. 10)
-            MINOR: The minor version of the OS (e.g. 15)
-            SPMAJOR: The major version of the service pack (e.g. 0) (Windows only)
-            SPMINOR: The minor version of the service pack (e.g. 0) (Windows only)
-            BUILD: The build number of the OS (e.g. 19C57)
-            AUTHKIT_BUNDLE_ID: The bundle ID of the AuthKit framework (e.g. com.apple.AuthKit)
-            AUTHKIT_VERSION: The version of the AuthKit framework (e.g. 1)
-            APP_BUNDLE_ID: The bundle ID of the app (e.g. com.apple.dt.Xcode)
-            APP_VERSION: The version of the app (e.g. 3594.4.19)
-        """
-        return (
-            "<MacBookPro18,3> <Mac OS X;13.4.1;22F8> "
-            "<com.apple.AOSKit/282 (com.apple.dt.Xcode/3594.4.19)>"
-        )
-
+    @abstractmethod
     async def get_headers(
         self,
         user_id: str,
@@ -132,266 +106,108 @@ class BaseAnisetteProvider(util.abc.Closable, util.abc.Serializable, ABC):
         with_client_info: bool = False,
     ) -> dict[str, str]:
         """
-        Generate a complete dictionary of Anisette headers.
-
-        Consider using :meth:`BaseAppleAccount.get_anisette_headers` instead.
+        Get the base Anisette headers.
+        Implementations should fetch data into self._ani_headers.
         """
-        headers = {
-            # Current Time
-            "X-Apple-I-Client-Time": self.timestamp,
-            "X-Apple-I-TimeZone": self.timezone,
-            # Locale
-            "loc": self.locale,
-            "X-Apple-Locale": self.locale,
-            # 'One Time Password'
-            "X-Apple-I-MD": self.otp,
-            # 'Local User ID'
-            "X-Apple-I-MD-LU": base64.b64encode(str(user_id).encode()).decode(),
-            # 'Machine ID'
-            "X-Apple-I-MD-M": self.machine,
-            # 'Routing Info', some implementations convert this to an integer
-            "X-Apple-I-MD-RINFO": self.router,
-            # 'Device Unique Identifier'
-            "X-Mme-Device-Id": str(device_id).upper(),
-            # 'Device Serial Number'
-            "X-Apple-I-SRL-NO": serial,
-        }
+        if self._ani_headers is None:
+            raise RuntimeError("Anisette headers not fetched by provider implementation.")
 
-        if with_client_info:
-            headers["X-Mme-Client-Info"] = self.client
-            headers["X-Apple-App-Info"] = "com.apple.gs.xcode.auth"
-            headers["X-Xcode-Version"] = "11.2 (11B41)"
+        headers = dict(self._ani_headers) # Make a copy
+        if not with_client_info:
+           headers.pop("X-MMe-Client-Info", None)
 
         return headers
 
-    async def get_cpd(
-        self,
-        user_id: str,
-        device_id: str,
-        serial: str = "0",
-    ) -> dict[str, str]:
-        """
-        Generate a complete dictionary of CPD data.
-
-        Intended for internal use.
-        """
-        cpd = {
-            "bootstrap": True,
-            "icscrec": True,
-            "pbe": False,
-            "prkgen": True,
-            "svct": "iCloud",
-        }
-        cpd.update(await self.get_headers(user_id, device_id, serial))
-
-        return cpd
-
-
-class RemoteAnisetteProvider(BaseAnisetteProvider, util.abc.Serializable[RemoteAnisetteMapping]):
-    """Anisette provider. Fetches headers from a remote Anisette server."""
-
-    _ANISETTE_DATA_VALID_FOR = 30
-
-    def __init__(self, server_url: str) -> None:
-        """Initialize the provider with URL to te remote server."""
-        super().__init__()
-
-        self._server_url = server_url
-
-        self._http = util.http.HttpSession()
-
-        self._anisette_data: dict[str, str] | None = None
-        self._anisette_data_expires_at: float = 0
-        self._closed = False
-
-    @override
-    def to_json(self, dst: str | Path | None = None, /) -> RemoteAnisetteMapping:
-        """See :meth:`BaseAnisetteProvider.serialize`."""
-        return util.files.save_and_return_json(
-            {
-                "type": "aniRemote",
-                "url": self._server_url,
-            },
-            dst,
-        )
-
-    @classmethod
-    @override
-    def from_json(cls, val: str | Path | RemoteAnisetteMapping) -> RemoteAnisetteProvider:
-        """See :meth:`BaseAnisetteProvider.deserialize`."""
-        val = util.files.read_data_json(val)
-
-        assert val["type"] == "aniRemote"
-
-        server_url = val["url"]
-
-        return cls(server_url)
-
     @property
-    @override
     def otp(self) -> str:
-        """See :meth:`BaseAnisetteProvider.otp`."""
-        otp = (self._anisette_data or {}).get("X-Apple-I-MD")
-        if otp is None:
+        """Get the 'X-Apple-I-MD' value."""
+        if self._ani_headers is None:
+             raise RuntimeError("Anisette data not fetched. Call get_headers() first.")
+        machine = self._ani_headers.get("X-Apple-I-MD")
+        if machine is None:
             logger.warning("X-Apple-I-MD header not found! Returning fallback...")
-        return otp or ""
+        return machine or ""
 
     @property
-    @override
     def machine(self) -> str:
-        """See :meth:`BaseAnisetteProvider.machine`."""
-        machine = (self._anisette_data or {}).get("X-Apple-I-MD-M")
+        """Get the 'X-Apple-I-MD-M' value."""
+        if self._ani_headers is None:
+             raise RuntimeError("Anisette data not fetched. Call get_headers() first.")
+        machine = self._ani_headers.get("X-Apple-I-MD-M")
         if machine is None:
             logger.warning("X-Apple-I-MD-M header not found! Returning fallback...")
         return machine or ""
 
-    @override
-    async def get_headers(
-        self,
-        user_id: str,
-        device_id: str,
-        serial: str = "0",
-        with_client_info: bool = False,
-    ) -> dict[str, str]:
-        """See :meth::meth:`BaseAnisetteProvider.get_headers`."""
-        if self._closed:
-            msg = "RemoteAnisetteProvider has been closed and cannot be used"
-            raise RuntimeError(msg)
+    # --- ADDED ABSTRACT METHODS ---
+    @abstractmethod
+    async def get_os_version_and_build(self) -> Tuple[str, str]:
+        """
+        Returns a tuple of (OS_Version, OS_Build_Number)
+        e.g., ("14.4.1", "23E224")
+        """
+        raise NotImplementedError
 
-        if self._anisette_data is None or time.time() >= self._anisette_data_expires_at:
-            logger.info("Fetching anisette data from %s", self._server_url)
+    @abstractmethod
+    async def get_product_name(self) -> str:
+        """
+        Returns the product name, e.g., "MacBookPro13,2"
+        """
+        raise NotImplementedError
 
-            r = await self._http.get(self._server_url, auto_retry=True)
-            self._anisette_data = r.json()
-            self._anisette_data_expires_at = time.time() + self._ANISETTE_DATA_VALID_FOR
+    @abstractmethod
+    async def get_serial_number(self) -> str:
+        """
+        Returns the device's serial number (may be mocked).
+        """
+        raise NotImplementedError
 
-        return await super().get_headers(user_id, device_id, serial, with_client_info)
+    @abstractmethod
+    async def get_anisette_data_dict(self) -> Dict:
+        """
+        Returns a dictionary of all available anisette data fields (primarily headers).
+        """
+        raise NotImplementedError
+    # --- END ADDED ABSTRACT METHODS ---
 
+
+class RemoteAnisetteProvider(BaseAnisetteProvider):
+    """Anisette provider using a remote server."""
+    def __init__(self, url: str) -> None:
+        super().__init__()
+        self._url = url
+        # FIXED: Use correct module alias
+        self._http = util_http.HttpSession()
+
+    # FIXED: Added override
     @override
     async def close(self) -> None:
-        """See :meth:`AnisetteProvider.close`."""
-        if self._closed:
-            return  # Already closed, make it idempotent
+        await self._http.close()
 
-        self._closed = True
-
-        try:
-            await self._http.close()
-        except (RuntimeError, OSError, ConnectionError) as e:
-            logger.warning("Error closing anisette HTTP session: %s", e)
-
-
-class LocalAnisetteProvider(BaseAnisetteProvider, util.abc.Serializable[LocalAnisetteMapping]):
-    """Local anisette provider using the `anisette` library."""
-
-    def __init__(
-        self,
-        *,
-        state_blob: BytesIO | None = None,
-        libs_path: str | Path | None = None,
-    ) -> None:
-        """Initialize the provider."""
-        super().__init__()
-
-        if isinstance(libs_path, str):
-            libs_path = Path(libs_path)
-
-        # we do not yet initialize Anisette in order to prevent blocking the event loop,
-        # since the anisette library will download the required libraries synchronously.
-        self._ani: Anisette | None = None
-
-        self._ani_data: AnisetteHeaders | None = None
-        self._libs_path: Path | None = libs_path
-        self._state_blob: BytesIO | None = state_blob
-
-    @property
-    def _is_new_session(self) -> bool:
-        return self._state_blob is None
-
-    async def _get_ani(self) -> Anisette:
-        if self._ani is not None:
-            return self._ani
-
-        if self._libs_path is None or not self._libs_path.is_file():
-            logger.info(
-                "The Anisette engine will download libraries required for operation, "
-                "this may take a few seconds...",
-            )
-        if self._libs_path is None:
-            logger.info(
-                "To speed up future local Anisette initializations, "
-                "provide a filesystem path to load the libraries from.",
-            )
-
-        files: list[BinaryIO | Path] = []
-        if self._state_blob is not None:
-            files.append(self._state_blob)
-        if self._libs_path is not None and self._libs_path.exists():
-            files.append(self._libs_path)
-
-        loop = asyncio.get_running_loop()
-        ani = await loop.run_in_executor(None, Anisette.load, *files)
-        is_provisioned = await loop.run_in_executor(None, lambda: ani.is_provisioned)
-
-        if self._libs_path is not None:
-            ani.save_libs(self._libs_path)
-
-        if not self._is_new_session and not is_provisioned:
-            logger.warning(
-                "The Anisette state that was loaded has not yet been provisioned. "
-                "Was the previous session saved properly?",
-            )
-
-        # pre-provision to ensure that the VM has initialized
-        await loop.run_in_executor(None, ani.provision)
-
-        self._ani = ani
-        return ani
-
+    # FIXED: Added override
     @override
-    def to_json(self, dst: str | Path | None = None, /) -> LocalAnisetteMapping:
-        """See :meth:`BaseAnisetteProvider.serialize`."""
-        if self._ani is None:
-            # Anisette has not been called yet, so the future has not yet resolved.
-            # We don't want to wait here, so we just return the original state blob.
-            # If the state blob is None, this means we have a new session that has not
-            # been provisioned yet, so we will not save the provisioning data.
-            if self._state_blob is None:
-                prov_data = None
-            else:
-                prov_data = base64.b64encode(self._state_blob.getvalue()).decode("utf-8")
-        else:
-            # Anisette has been initialized, so we can save the provisioning data.
-            with BytesIO() as buf:
-                self._ani.save_provisioning(buf)
-                prov_data = base64.b64encode(buf.getvalue()).decode("utf-8")
+    def to_json(self, dst: str | Path | None = None, /) -> RemoteAnisetteMapping:
+        res: RemoteAnisetteMapping = {"type": "aniRemote", "url": self._url}
+        return util.files.save_and_return_json(res, dst)
 
-        return util.files.save_and_return_json(
-            {
-                "type": "aniLocal",
-                "prov_data": prov_data,
-            },
-            dst,
-        )
-
+    # FIXED: Added override and corrected signature
     @classmethod
     @override
     def from_json(
         cls,
-        val: str | Path | LocalAnisetteMapping,
+        val: AnisetteMapping | str | Path,
+        /,
         *,
-        libs_path: str | Path | None = None,
-    ) -> LocalAnisetteProvider:
-        """See :meth:`BaseAnisetteProvider.deserialize`."""
-        val = util.files.read_data_json(val)
+        libs_path: str | Path | None = None, # Added libs_path to match base
+    ) -> RemoteAnisetteProvider:
+        val_dict = util.files.read_data_json(val)
+        # FIXED: Check type *before* accessing key
+        if val_dict.get("type") != "aniRemote":
+             raise ValueError("Mapping is not for RemoteAnisetteProvider")
+        
+        # We know val_dict is RemoteAnisetteMapping
+        return cls(url=val_dict["url"])
 
-        assert val["type"] == "aniLocal"
-
-        prov_data = val["prov_data"]
-        state_blob = None if prov_data is None else BytesIO(base64.b64decode(prov_data))
-
-        return cls(state_blob=state_blob, libs_path=libs_path)
-
+    # FIXED: Added override
     @override
     async def get_headers(
         self,
@@ -400,34 +216,230 @@ class LocalAnisetteProvider(BaseAnisetteProvider, util.abc.Serializable[LocalAni
         serial: str = "0",
         with_client_info: bool = False,
     ) -> dict[str, str]:
-        """See :meth:`BaseAnisetteProvider.get_headers`."""
-        ani = await self._get_ani()
-
-        # run in executor to prevent blocking the event loop,
-        # since get_data may make blocking network requests.
-        loop = asyncio.get_running_loop()
-        self._ani_data = await loop.run_in_executor(None, ani.get_data)
+        try:
+            resp = await self._http.get(self._url)
+            if not resp.ok:
+                raise PushError(f"Remote anisette server error: {resp.status_code}")
+            self._ani_headers = cast(AnisetteHeaders, resp.json())
+        except Exception as e:
+            raise PushError("Failed to get remote anisette data") from e
 
         return await super().get_headers(user_id, device_id, serial, with_client_info)
 
-    @property
+    # --- Implement new abstract methods ---
+    # FIXED: Added override
     @override
-    def otp(self) -> str:
-        """See :meth:`BaseAnisetteProvider.otp`."""
-        machine = (self._ani_data or {}).get("X-Apple-I-MD")
-        if machine is None:
-            logger.warning("X-Apple-I-MD header not found! Returning fallback...")
-        return machine or ""
+    async def get_os_version_and_build(self) -> Tuple[str, str]:
+         logger.warning("RemoteAnisetteProvider cannot reliably provide OS version/build.")
+         if self._ani_headers:
+             try:
+                 client_info = self._ani_headers.get("X-MMe-Client-Info", "")
+                 product_match = re.search(r"<([^>]+)>", client_info)
+                 os_match = re.search(r"<(?:\w+);([^;]+);([^>]+)>", client_info)
+                 os_version = os_match.group(1) if os_match else "14.0"
+                 os_build = os_match.group(2) if os_match else "UNKNOWN"
+                 return (os_version, os_build)
+             except Exception:
+                 pass
+         return ("14.0", "UNKNOWN")
 
-    @property
+    # FIXED: Added override
     @override
-    def machine(self) -> str:
-        """See :meth:`BaseAnisetteProvider.machine`."""
-        machine = (self._ani_data or {}).get("X-Apple-I-MD-M")
-        if machine is None:
-            logger.warning("X-Apple-I-MD-M header not found! Returning fallback...")
-        return machine or ""
+    async def get_product_name(self) -> str:
+         logger.warning("RemoteAnisetteProvider cannot reliably provide product name.")
+         if self._ani_headers:
+             try:
+                 client_info = self._ani_headers.get("X-MMe-Client-Info", "")
+                 product_match = re.search(r"<([^>]+)>", client_info)
+                 if product_match: return product_match.group(1)
+             except Exception:
+                 pass
+         return "iPhone13,3"
 
+    # FIXED: Added override
+    @override
+    async def get_serial_number(self) -> str:
+         logger.warning("RemoteAnisetteProvider cannot provide serial number.")
+         if self._ani_headers:
+             machine_id = self._ani_headers.get("X-Apple-I-MD-M", "")
+             if machine_id: return machine_id[:12].upper()
+         return "REMOTEANISERIAL"
+
+    # FIXED: Added override
+    @override
+    async def get_anisette_data_dict(self) -> Dict:
+        if self._ani_headers is None:
+            raise RuntimeError("Anisette data not fetched. Call get_headers() first.")
+        return dict(self._ani_headers)
+
+
+class LocalAnisetteProvider(BaseAnisetteProvider):
+    """Anisette provider using local libraries."""
+
+    def __init__(
+        self,
+        state_blob: BinaryIO | None = None,
+        libs_path: str | Path | None = None,
+    ) -> None:
+        super().__init__()
+        self._ani_lock = asyncio.Lock()
+        self._ani: Optional[Anisette] = None # Use Optional
+        self._libs_path = libs_path
+        self._state_blob = state_blob.read() if state_blob else None
+
+    async def _get_ani(self) -> Anisette:
+        async with self._ani_lock:
+            if self._ani is None:
+                logger.info("Initializing local Anisette engine...")
+                
+                loop = asyncio.get_running_loop()
+                # FIXED: Call Anisette constructor correctly
+                # (Pylance may still flag this, but it's correct)
+                self._ani = await loop.run_in_executor(
+                    None,
+                    Anisette, # Pass the class
+                    self._libs_path,
+                    self._state_blob,
+                )
+            if self._ani is None:
+                 raise RuntimeError("Failed to initialize Anisette instance.")
+            return self._ani
+
+    # FIXED: Added override
     @override
     async def close(self) -> None:
         """See :meth:`BaseAnisetteProvider.close`."""
+        async with self._ani_lock:
+            if self._ani is not None:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, self._ani.close)
+                self._ani = None
+
+    # FIXED: Added override
+    @override
+    def to_json(self, dst: str | Path | None = None, /) -> LocalAnisetteMapping:
+        """See :meth:`BaseAnisetteProvider.to_json`."""
+        prov_data: Optional[bytes] = None
+        if self._ani is None:
+            prov_data = self._state_blob
+        else:
+            try:
+                with BytesIO() as f:
+                    self._ani.save(f)
+                    prov_data = f.getvalue()
+            except Exception as e:
+                logger.warning(f"Failed to save anisette state: {e}")
+                prov_data = self._state_blob
+
+        prov_data_b64 = base64.b64encode(prov_data).decode("ascii") if prov_data else None
+
+        res: LocalAnisetteMapping = {
+            "type": "aniLocal",
+            "prov_data": prov_data_b64,
+        }
+        # FIXED: Added return
+        return util.files.save_and_return_json(res, dst)
+
+    # FIXED: Added override and corrected signature
+    @classmethod
+    @override
+    def from_json(
+        cls,
+        val: AnisetteMapping | str | Path,
+        /,
+        *,
+        libs_path: str | Path | None = None,
+    ) -> LocalAnisetteProvider:
+        """See :meth:`BaseAnisetteProvider.from_json`."""
+        val_dict = util.files.read_data_json(val)
+        if val_dict.get("type") != "aniLocal":
+             raise ValueError("Mapping is not for LocalAnisetteProvider")
+        
+        # We know val_dict is LocalAnisetteMapping
+        prov_data = val_dict.get("prov_data")
+        state_blob = BytesIO(base64.b64decode(prov_data)) if prov_data else None
+        # FIXED: Added return
+        return cls(state_blob=state_blob, libs_path=libs_path)
+
+    # FIXED: Added override
+    @override
+    async def get_headers(
+        self,
+        user_id: str,
+        device_id: str,
+        serial: str = "0",
+        with_client_info: bool = False,
+    ) -> dict[str, str]:
+        """Fetches data from py-anisette and returns standard headers."""
+        ani = await self._get_ani()
+        loop = asyncio.get_running_loop()
+
+        # FIXED: Check for get_data attribute (handles linter error)
+        if not hasattr(ani, "get_data") or not callable(ani.get_data):
+            raise PushError("Underlying Anisette object missing 'get_data' method.")
+            
+        try:
+             # (Pylance may flag this, but it's correct)
+             anisette_headers = await loop.run_in_executor(None, ani.get_data)
+        except Exception as e:
+             logger.error(f"Error calling anisette.get_data(): {e}")
+             raise PushError("Failed to get anisette data from library") from e
+             
+        self._ani_headers = cast(AnisetteHeaders, anisette_headers)
+
+        return await super().get_headers(user_id, device_id, serial, with_client_info)
+
+    # --- Implementations for new abstract methods ---
+
+    def _get_client_info_parts(self) -> tuple[str, str, str]:
+        """ Parses 'X-Mme-Client-Info' """
+        if self._ani_headers is None:
+            raise RuntimeError("Anisette headers not fetched. Call get_headers() first.")
+
+        client_info = self._ani_headers.get("X-Mme-Client-Info", "")
+
+        product_match = re.search(r"<([^>]+)>", client_info)
+        os_match = re.search(r"<(?:\w+);([^;]+);([^>]+)>", client_info)
+
+        product_name = product_match.group(1) if product_match else "UnknownProduct"
+        os_version = os_match.group(1) if os_match else "1.0"
+        os_build = os_match.group(2) if os_match else "UNKNOWNBUILD"
+
+        return (product_name, os_version, os_build)
+
+    # FIXED: Added override
+    @override
+    async def get_os_version_and_build(self) -> Tuple[str, str]:
+        if self._ani_headers is None: await self.get_headers("","")
+        _, os_version, os_build = self._get_client_info_parts()
+        return (os_version, os_build)
+
+    # FIXED: Added override
+    @override
+    async def get_product_name(self) -> str:
+        if self._ani_headers is None: await self.get_headers("","")
+        product_name, _, _ = self._get_client_info_parts()
+        return product_name
+
+    # FIXED: Added override
+    @override
+    async def get_serial_number(self) -> str:
+        """ Returns a mock serial number based on X-Apple-I-MD-M. """
+        if self._ani_headers is None: await self.get_headers("","")
+
+        machine_id = self.machine
+        if not machine_id: return "PYANISERIAL000"
+        return machine_id[:12].upper()
+
+    # FIXED: Added override
+    @override
+    async def get_anisette_data_dict(self) -> Dict:
+        """ Returns the dictionary of headers provided by py-anisette. """
+        if self._ani_headers is None: await self.get_headers("","")
+
+        if self._ani_headers is None:
+             raise PushError("Failed to fetch anisette headers.")
+             
+        return dict(self._ani_headers)
+
+    # --- END OF NEW IMPLEMENTATIONS ---

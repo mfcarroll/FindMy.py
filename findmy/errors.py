@@ -23,3 +23,10 @@ class InvalidStateError(RuntimeError):
 
     For example: calling :meth:`BaseAppleAccount.login` while already logged in.
     """
+
+class PushError(Exception):
+    """
+    A generic error related to the Apple Push/iCloud system.
+    
+    Used as a catch-all for protocol failures ported from Rust.
+    """
