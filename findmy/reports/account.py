@@ -18,6 +18,8 @@ from typing import (
     Literal,
     TypedDict,
     TypeVar,
+    Optional,
+    Sequence,
     cast,
     overload,
 )
@@ -32,7 +34,10 @@ from findmy.errors import (
     InvalidStateError,
     UnauthorizedError,
     UnhandledProtocolError,
+    PushError,
 )
+from findmy.keychain.cloudkit_manager import CloudKitManager
+from findmy.util.http import HttpSession
 
 from .anisette import AnisetteMapping, get_provider_from_mapping
 from .reports import LocationReport, LocationReportsFetcher
@@ -326,11 +331,7 @@ class BaseAppleAccount(util.abc.Closable, util.abc.Serializable[AccountStateMapp
         raise NotImplementedError
 
     @abstractmethod
-    def get_anisette_headers(
-        self,
-        with_client_info: bool = False,
-        serial: str = "0",
-    ) -> MaybeCoro[dict[str, str]]:
+    def get_anisette_headers(self) -> MaybeCoro[dict[str, str]]:
         """
         Retrieve a complete dictionary of Anisette headers.
 
@@ -361,6 +362,7 @@ class AsyncAppleAccount(BaseAppleAccount):
         anisette: BaseAnisetteProvider,
         *,
         state_info: AccountStateMapping | None = None,
+        session: Optional[HttpSession] = None,
     ) -> None:
         """
         Initialize the apple account.
@@ -388,9 +390,39 @@ class AsyncAppleAccount(BaseAppleAccount):
             state_info["account"]["info"] if state_info else None
         )
 
-        self._http: util.http.HttpSession = util.http.HttpSession()
+        if session:
+            self._http = session # Use provided session
+            self._session_owner = False # We don't own it
+        else:
+            self._http = HttpSession() # Create our own
+            self._session_owner = True # We own it
+
         self._reports: LocationReportsFetcher = LocationReportsFetcher(self)
         self._closed: bool = False
+        self._cloudkit_manager: Optional[CloudKitManager] = None
+
+    async def _get_cloudkit_manager(self) -> CloudKitManager:
+        """Initializes and returns the CloudKitManager."""
+        if self.login_state < LoginState.AUTHENTICATED:
+            raise InvalidStateError(
+                f"CloudKitManager requires AUTHENTICATED state or higher, "
+                f"but state is {self.login_state.name}"
+            )
+
+        if self._cloudkit_manager is None:
+            logger.debug("Creating new CloudKitManager instance.")
+            if self._http is None:
+                raise InvalidStateError("HTTP session not initialized.")
+            if self._anisette is None:
+                raise InvalidStateError("Anisette provider not initialized.")
+
+            self._cloudkit_manager = CloudKitManager(
+                account=self,
+                anisette_provider=self._anisette,
+                http_session=self._http
+            )
+            await self._cloudkit_manager._ensure_initialized()
+        return self._cloudkit_manager
 
     def _set_login_state(
         self,
@@ -489,24 +521,34 @@ class AsyncAppleAccount(BaseAppleAccount):
     async def close(self) -> None:
         """
         Close any sessions or other resources in use by this object.
-
         Should be called when the object will no longer be used.
         """
         if self._closed:
-            return  # Already closed, make it idempotent
-
+            return
         self._closed = True
 
-        # Close in proper order: anisette first, then HTTP session
+        self._set_login_state(LoginState.LOGGED_OUT)
+
+        # Dereference the CloudKitManager first, as it depends on _http
+        if self._cloudkit_manager:
+            logger.debug("Clearing CloudKitManager...")
+            self._cloudkit_manager = None
+
+        # Close anisette first, as per the existing comment
         try:
             await self._anisette.close()
-        except (RuntimeError, OSError, ConnectionError) as e:
-            logger.warning("Error closing anisette provider: %s", e)
+        except Exception as e:
+            logger.warning(f"Error closing anisette provider: {e}")
 
-        try:
-            await self._http.close()
-        except (RuntimeError, OSError, ConnectionError) as e:
-            logger.warning("Error closing HTTP session: %s", e)
+        # Now, close the HTTP session *if* we own it
+        if self._session_owner and self._http:
+            logger.debug("Closing owned HttpSession...")
+            try:
+                await self._http.close()
+            except Exception as e:
+                logger.warning(f"Error closing HTTP session: {e}")
+            finally:
+                self._http = None # Clear reference
 
     @_require_login_state(LoginState.LOGGED_OUT)
     @override
@@ -665,6 +707,8 @@ class AsyncAppleAccount(BaseAppleAccount):
             # Remove when real issue fixed
             retry_counter = 1
             while True:
+                if self._http is None:
+                    raise InvalidStateError("Account session is closed.")
                 resp = await self._http.post(
                     self._ENDPOINT_REPORTS_FETCH,
                     auth=auth,
@@ -925,6 +969,8 @@ class AsyncAppleAccount(BaseAppleAccount):
         # --- End STEP 2 ---
 
         # Existing request call using the internal _http session
+        if self._http is None:
+            raise InvalidStateError("Account session is closed.")
         resp = await self._http.post(
             self._ENDPOINT_LOGIN_MOBILEME,
             auth=(self._username or "", self._login_state_data["idms_pet"]),
@@ -1010,8 +1056,10 @@ class AsyncAppleAccount(BaseAppleAccount):
                 "X-Apple-Identity-Token": identity_token,
             },
         )
-        headers.update(await self.get_anisette_headers(with_client_info=True))
+        headers.update(await self.get_anisette_headers())
 
+        if self._http is None:
+            raise InvalidStateError("Account session is closed.")
         r = await self._http.request(
             method,
             url,
@@ -1024,45 +1072,72 @@ class AsyncAppleAccount(BaseAppleAccount):
 
         return r.text()
 
-    async def _gsa_request(self, parameters: dict[str, Any]) -> dict[str, Any]:
-        body = {
-            "Header": {
-                "Version": "1.0.1",
-            },
-            "Request": {
-                "cpd": await self._anisette.get_cpd(
-                    self._uid,
-                    self._devid,
-                ),
-                **parameters,
-            },
-        }
+    async def _gsa_request(self, parameters: dict) -> dict:
+        """Helper for making GrandSlam Authentication requests."""
 
+        # First, ensure anisette data is populated by calling get_headers
+        # This will trigger the underlying py-anisette call if not already done.
+        anisette_headers = await self._anisette.get_headers(self._uid, self._devid)
+
+        # Now, get the full hardware config dictionary
+        config = self._anisette.get_hardware_config_dict()
+
+        try:
+            # Extract the required data from the config dict
+            cpd = config["cpd"]
+            client_info = config["X-Mme-Client-Info"]
+        except KeyError as e:
+            logger.error(f"Anisette data is missing required GSA key: {e}")
+            raise PushError(f"Anisette provider data incomplete, missing {e}") from e
+
+        body = {"Header": {"Version": "1.0.1"}, "Request": {"cpd": cpd, **parameters}}
+
+        # Build headers, merging standard ones with all anisette headers
         headers = {
             "Content-Type": "text/x-xml-plist",
             "Accept": "*/*",
             "User-Agent": "akd/1.0 CFNetwork/978.0.7 Darwin/18.7.0",
-            "X-MMe-Client-Info": self._anisette.client,
+            **anisette_headers, # Add all anisette headers
+            "X-MMe-Client-Info": client_info, # Ensure this one is correct
         }
 
-        resp = await self._http.post(
-            self._ENDPOINT_GSA,
-            headers=headers,
-            data=plistlib.dumps(body),
-        )
+        if self._http is None:
+            raise InvalidStateError("Account is closed.")
+
+        resp: util.http.HttpResponse = await self._http.post(self._ENDPOINT_GSA, headers=headers, data=plistlib.dumps(body))
         if not resp.ok:
-            msg = f"Error response for GSA request: {resp.status_code}"
-            raise UnhandledProtocolError(msg)
+            raise UnhandledProtocolError(f"GSA request error: {resp.status_code}")
         return resp.plist()["Response"]
+
+    async def _get_mme_token(self, token_key: str) -> str:
+        """Helper to get a specific MME token, refreshing if needed."""
+        if self.login_state != LoginState.LOGGED_IN:
+            raise InvalidStateError(f"Token fetch requires LOGGED_IN state, but state is {self.login_state.name}")
+
+        # Safely access nested dictionary structure
+        token = self._login_state_data.get("mobileme_data", {}).get("tokens", {}).get(token_key)
+
+        if not token:
+            logger.warning(f"MME token '{token_key}' not found in state, attempting refresh...")
+            # Trigger re-login to refresh tokens
+            auth_state = await self._gsa_authenticate() # Re-auth uses stored creds
+            if auth_state != LoginState.AUTHENTICATED:
+                raise PushError(f"Re-authentication failed or requires 2FA during token refresh. State: {auth_state.name}")
+
+            await self._login_mobileme()
+
+            token = self._login_state_data.get("mobileme_data", {}).get("tokens", {}).get(token_key)
+            if not token:
+                raise PushError(f"Failed to get MME token '{token_key}' even after refresh.")
+
+        return token
 
     @override
     async def get_anisette_headers(
-        self,
-        with_client_info: bool = False,
-        serial: str = "0",
+        self
     ) -> dict[str, str]:
         """See :meth:`BaseAppleAccount.get_anisette_headers`."""
-        return await self._anisette.get_headers(self._uid, self._devid, serial, with_client_info)
+        return await self._anisette.get_headers(self._uid, self._devid)
 
     @property
     def idms_pet(self) -> str | None:
@@ -1086,9 +1161,10 @@ class AppleAccount(BaseAppleAccount):
         anisette: BaseAnisetteProvider,
         *,
         state_info: AccountStateMapping | None = None,
+        session: Optional[HttpSession] = None,
     ) -> None:
         """See :meth:`AsyncAppleAccount.__init__`."""
-        self._asyncacc = AsyncAppleAccount(anisette=anisette, state_info=state_info)
+        self._asyncacc = AsyncAppleAccount(anisette=anisette, state_info=state_info, session=session)
 
         try:
             self._evt_loop = asyncio.get_running_loop()
@@ -1269,9 +1345,7 @@ class AppleAccount(BaseAppleAccount):
     @override
     def get_anisette_headers(
         self,
-        with_client_info: bool = False,
-        serial: str = "0",
     ) -> dict[str, str]:
         """See :meth:`AsyncAppleAccount.get_anisette_headers`."""
-        coro = self._asyncacc.get_anisette_headers(with_client_info, serial)
+        coro = self._asyncacc.get_anisette_headers()
         return self._evt_loop.run_until_complete(coro)
