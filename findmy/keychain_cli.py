@@ -8,15 +8,13 @@ import json
 import logging
 import os
 import sys
-from typing import Any # Added Any for json default
+from typing import Any, Optional, cast
 
-# Use absolute imports relative to the 'findmy' package root
 from findmy.reports.account import AsyncAppleAccount, LoginState
 from findmy.reports.anisette import get_provider_from_mapping
-# Note: Assuming KeychainClientState is correctly defined in client.py now
 from findmy.keychain.client import KeychainClient, KeychainClientState
-# Assuming save_data_json and read_data_json exist in findmy.util.files
-from findmy.util.files import read_data_json, save_data_json
+from findmy.reports.state import AnisetteMapping
+from findmy.util.files import read_data_json, save_and_return_json
 # Necessary for handling bytes/Data in JSON output
 from plistlib import Data
 
@@ -88,7 +86,7 @@ async def run_keychain_flow(args: argparse.Namespace):
     try:
         # Determine anisette mapping (load from state or default to local)
         anisette_mapping = initial_acc_state.get('anisette') if initial_acc_state else {"provider_id": "local"}
-        anisette = get_provider_from_mapping(anisette_mapping)
+        anisette = get_provider_from_mapping(initial_acc_state.get('anisette', {})) if initial_acc_state else get_provider_from_mapping(cast(AnisetteMapping, {"provider_id": "local"}))
         acc = AsyncAppleAccount(anisette=anisette, state_info=initial_acc_state)
 
         # --- 3. Login / Resume Session ---
@@ -142,6 +140,7 @@ async def run_keychain_flow(args: argparse.Namespace):
                  "user_identity": None,
                  "keystore": {},
                  "keychain_items": {},
+                 "sync_tokens": {},
              }
         else:
              # Validate/Ensure required top-level keys exist if loading state

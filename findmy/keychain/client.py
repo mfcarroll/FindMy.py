@@ -18,7 +18,7 @@ from miscreant.aes.siv import SIV
 from . import cloudkit_pb2 as ckproto
 from .identity import KeychainUserIdentity
 from findmy.reports.anisette import BaseAnisetteProvider
-from findmy.errors import PushError
+from findmy.errors import PushError, InvalidStateError
 from .cuttlefish_client import CuttlefishClient
 from findmy.reports.account import AsyncAppleAccount
 from . import crypto_util, asn1_defs
@@ -862,6 +862,7 @@ class KeychainClient:
         logger.info(f"Processing {len(shares)} fetched TLK shares...")
         keys_added = 0
         for share_container in shares:
+            item_uuid = "Unknown"
             try:
                 # Basic validation
                 if not share_container.HasField("share") or not share_container.share.HasField("inner"):

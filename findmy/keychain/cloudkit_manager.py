@@ -10,6 +10,7 @@ from google.protobuf.message import Message
 from findmy.errors import PushError, UnhandledProtocolError, InvalidStateError
 from findmy.util.http import HttpSession, HttpResponse
 from . import cloudkit_pb2 as ckproto
+from .constants import PCS_ZONE_PROTECTED_STORAGE
 
 # Type hints to avoid circular import
 if TYPE_CHECKING:
@@ -393,7 +394,7 @@ class CloudKitManager:
                         raise PushError(f"Record fetch HTTP error ({response.status_code}) for zone {zone_name}")
 
                 # 5. Parse Delimited Response
-                response_body = response.content # Sync content
+                response_body = response._content # Sync content
 
                 def decode_uleb128(data: bytes) -> tuple[int, int]: # Simple ULEB128 decoder
                     result, shift, idx = 0, 0, 0
