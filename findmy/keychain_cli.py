@@ -16,7 +16,6 @@ from findmy.keychain.client import KeychainClient, KeychainClientState
 from findmy.reports.state import AnisetteMapping
 from findmy.util.files import read_data_json, save_and_return_json
 # Necessary for handling bytes/Data in JSON output
-from plistlib import Data
 
 logger = logging.getLogger(__name__)
 
@@ -253,7 +252,7 @@ async def run_keychain_flow(args: argparse.Namespace):
                     # Use the *current* state dict from the client object
                     'keychain': kc_client.state
                 }
-                save_data_json(final_state, state_file) # Use helper to save
+                save_and_return_json(final_state, state_file) # Use helper to save
                 logger.debug("State saved successfully.")
             except Exception as e:
                 logger.error(f"Failed to save state to {state_file}: {e}")
