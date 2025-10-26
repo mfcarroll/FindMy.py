@@ -454,3 +454,41 @@ class CloudKitManager:
             except Exception as e:
                 logger.error(f"Record fetch for zone {zone_name} failed during HTTP/parsing: {e}", exc_info=True)
                 raise PushError(f"Record fetch failed for zone {zone_name}") from e
+            
+    async def function_invoke(self, request: ckproto.FunctionInvokeRequest) -> bytes:
+            """
+            Sends a FunctionInvokeRequest to CloudKit and returns the raw response bytes.
+            Used by AsyncAppleAccount.invoke_cuttlefish().
+            """
+            await self._ensure_initialized()
+            if not self.ck_token:
+                raise PushError("Cannot invoke CloudKit function without token.")
+
+            invoke_url = "https://gateway.icloud.com/database/1/com.apple.security.keychain/private/records/functionInvoke"
+
+            headers = {
+                "Content-Type": 'application/x-protobuf; desc="https://gateway.icloud.com:443/static/protobuf/CloudDB/CloudDBClient.desc"; messageType=FunctionInvokeRequest',
+                "Accept": "application/x-protobuf",
+                "X-CloudKit-AuthToken": self.ck_token,
+                "X-CloudKit-UserId": self.user_id,
+                "X-CloudKit-ContainerId": CUTTLEFISH_CONTAINER_ID,
+                "X-CloudKit-BundleId": CUTTLEFISH_BUNDLE_ID,
+                "X-Apple-Request-UUID": str(uuid.uuid4()).upper(),
+                **(await self.anisette.get_headers(self.account._uid, self.account._devid)),
+            }
+
+            try:
+                response: HttpResponse = await self.http.post(
+                    invoke_url,
+                    headers=headers,
+                    data=request.SerializeToString(),
+                )
+
+                if not response.ok:
+                    text = response.text()
+                    raise PushError(f"CloudKit functionInvoke failed ({response.status_code}): {text}")
+
+                return response._content  # return raw bytes
+            except Exception as e:
+                logger.error(f"FunctionInvoke failed: {e}")
+                raise PushError("CloudKit functionInvoke failed") from e

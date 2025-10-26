@@ -6,7 +6,7 @@ import uuid
 import time
 import plistlib
 import cbor2
-from typing import TypedDict, Dict, List, Optional, cast, Any
+from typing import Tuple, TypedDict, Dict, List, Optional, Union, cast, Any
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -34,6 +34,14 @@ from .constants import (
     CUTTLEFISH_ITEM_TYPE,
     CUTTLEFISH_PROTECTION_TAG,
 )
+
+# near other imports at top of client.py
+from findmy.keychain.helpers.encoded_peer import GeneratedPeer
+from findmy.keychain.helpers.vouching import (
+    create_cuttlefish_peer_for_identity,
+    request_voucher_for_peer_via_cloudkit,
+)
+
 
 logger = logging.getLogger(__name__)
 
@@ -305,6 +313,64 @@ class KeychainClient:
         # Other fields (secrets, recovery keys, etc.) are left default/empty for now
 
         return stable_info
+
+    async def create_local_encoded_peer(
+        self,
+    ) -> Tuple[ckproto.CuttlefishPeer, Union["EncodedPeer", "GeneratedPeer"]]:
+        """
+        Create a CuttlefishPeer for this client identity and return both the
+        CuttlefishPeer proto and an EncodedPeer wrapper (for signature/public key helpers).
+        """
+        # Ensure we have a persisted identity (KeychainUserIdentity)
+        identity = await self.ensure_user_identity()
+
+        # Generate PeerStableInfo proto using your existing function
+        stable_info_proto = await self.generate_stable_info()
+
+        # Sign stable_info using the local identity keys (this produces SignedInfo)
+        signed_stable = identity.sign_stable_info(stable_info_proto)
+
+        # Build the CuttlefishPeer protobuf using KeychainUserIdentity helper
+        cuttlefish_peer = identity.to_cuttlefish_peer(signed_stable, voucher=None)
+
+        # Create GeneratedPeer wrapper in case you need raw signature/public-key formats
+        # For the GeneratedPeer byte buffer, use the serialized stable_info (not the SignedInfo wrapper)
+        encoded_peer = GeneratedPeer.new(stable_info_proto.SerializeToString())
+
+        return cuttlefish_peer, encoded_peer
+
+    async def request_voucher_for_peer(
+        self, sponsor_hint: Optional[str] = None
+    ) -> bytes:
+        """
+        Request a voucher for our local peer via CloudKit/Cuttlefish.
+
+        sponsor_hint: optional sponsor peer id (hash) to suggest which existing device to use as sponsor.
+                      The sponsor selection is generally handled by the server and/or the user on another device.
+        Returns raw voucher bytes (serialized SignedInfo) on success.
+
+        NOTE: This function *requests* a voucher. A sponsor device (trusted device) must
+        ultimately approve/issue the voucher. The server may return the voucher directly
+        (if auto-approved) or return a pointer indicating the voucher will be generated
+        by the sponsor device (out-of-band). The sponsor workflow is usually manual.
+        """
+        # Build local peer
+        cuttlefish_peer, encoded_peer = await self.create_local_encoded_peer()
+
+        # Get CloudKitManager from account
+        cloudkit_manager = await self.account._get_cloudkit_manager()
+
+        # Use the vouching helper to call into Cuttlefish
+        try:
+            voucher_bytes, signed_info = await request_voucher_for_peer_via_cloudkit(
+                cloudkit_manager, cuttlefish_peer
+            )
+            logger.info("Voucher request returned data.")
+            # If voucher_bytes are raw proto bytes (SignedInfo), return base64 raw bytes encoded for transport
+            return voucher_bytes
+        except Exception as e:
+            logger.error(f"Requesting voucher failed: {e}")
+            raise
 
     # --- ADD apply_changes method ---
     def apply_changes(self, changes: ckproto.CuttlefishChanges):

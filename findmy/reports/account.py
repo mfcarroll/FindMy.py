@@ -52,6 +52,9 @@ from .twofactor import (
     SyncTrustedDeviceSecondFactor,
 )
 
+from findmy.keychain import cloudkit_pb2 as ckproto
+from google.protobuf.message import Message
+
 # --- Add this logging configuration ---
 logging.basicConfig(
     level=logging.DEBUG,  # Capture detailed logs
@@ -1147,6 +1150,59 @@ class AsyncAppleAccount(BaseAppleAccount):
         and may be cleared on subsequent logins.
         """
         return self._idms_pet
+    
+    @property
+    def cloudkit_manager(self) -> CloudKitManager:
+        """Lazily get or create a CloudKitManager instance."""
+        if not hasattr(self, "_cloudkit_manager") or self._cloudkit_manager is None:
+            from findmy.keychain.cloudkit_manager import CloudKitManager
+            self._cloudkit_manager = CloudKitManager(
+                account=self,
+                anisette_provider=self._anisette,
+                http_session=self._http or HttpSession()
+            )
+        return self._cloudkit_manager
+
+    async def invoke_cuttlefish(
+        self,
+        function_name: str,
+        request: Message,
+        response_cls: type[Message],
+    ) -> Message:
+        """
+        Invokes a Cuttlefish CloudKit function using CloudKit's FunctionInvokeRequest.
+
+        Args:
+            function_name: Name of the Cuttlefish function (e.g., "establish", "joinWithVoucher").
+            request: The request protobuf to serialize and send.
+            response_cls: The response protobuf class to parse into.
+
+        Returns:
+            An instance of response_cls.
+        """
+        from findmy.keychain.cloudkit_pb2 import FunctionInvokeRequest  # local import to avoid cycles
+
+        logger.info(f"[Cuttlefish] Invoking function: {function_name}")
+
+        try:
+            # Construct the CloudKit FunctionInvokeRequest
+            function_request = FunctionInvokeRequest()
+            function_request.name = f"com.apple.security.keychain.{function_name}"
+            function_request.parameters = request.SerializeToString()
+            function_request.service = "com.apple.security.keychain"
+
+            # Actually send this request via CloudKitManager
+            result_bytes = await self.cloudkit_manager.function_invoke(function_request)
+
+            # Parse into the provided response protobuf class
+            response = response_cls()
+            response.ParseFromString(bytes(result_bytes))  # enforce bytes not bytearray
+            return response
+
+        except Exception as e:
+            logger.error(f"Failed to invoke Cuttlefish function '{function_name}': {e}")
+            raise PushError(f"Cuttlefish invoke error: {e}")
+
 
 
 class AppleAccount(BaseAppleAccount):
