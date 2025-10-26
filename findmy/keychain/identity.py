@@ -4,7 +4,7 @@ import os
 import time
 import uuid
 import logging
-import base64  # <-- 1. ADD THIS IMPORT
+import base64
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import Prehashed
@@ -12,7 +12,7 @@ from cryptography.exceptions import InvalidSignature
 
 # Import the generated protobuf classes
 from findmy.keychain import cloudkit_pb2 as ckproto
-from google.protobuf.message import Message  # <-- 2. ADD THIS IMPORT
+from google.protobuf.message import Message
 
 logger = logging.getLogger(__name__)
 
@@ -31,19 +31,20 @@ class KeychainUserIdentity:
         self._encryption_key: ec.EllipticCurvePrivateKey = ec.generate_private_key(ec.SECP384R1())
         logger.debug("Generated signing and encryption key pairs (SECP384r1).")
 
+        # ** FIX: Constructor ** (Already done correctly here)
         permanent_info = ckproto.PeerPermanentInfo()
         permanent_info.epoch = 1
-        permanent_info.signing_key = self._signing_key.public_key().public_bytes(
+        permanent_info.signing_key = self._signing_key.public_key().public_bytes( # type: ignore
             encoding=serialization.Encoding.DER,
             format=serialization.PublicFormat.SubjectPublicKeyInfo
         )
-        permanent_info.encryption_key = self._encryption_key.public_key().public_bytes(
+        permanent_info.encryption_key = self._encryption_key.public_key().public_bytes( # type: ignore
             encoding=serialization.Encoding.DER,
             format=serialization.PublicFormat.SubjectPublicKeyInfo
         )
-        permanent_info.machine_id = machine_id
-        permanent_info.model_id = model_id
-        permanent_info.creation_time = duration_since_epoch_millis()
+        permanent_info.machine_id = machine_id # type: ignore
+        permanent_info.model_id = model_id # type: ignore
+        permanent_info.creation_time = duration_since_epoch_millis() # type: ignore
 
         # Sign the permanent info
         self.info: ckproto.SignedInfo = self._sign_payload(permanent_info, b"TPPB.PeerPermanentInfo")
@@ -58,6 +59,7 @@ class KeychainUserIdentity:
         logger.info(f"Generated Identity ID: {self.identifier}")
 
         # Initialize dynamic state (clock starts at 0)
+        # ** FIX: Constructor ** (Already done correctly here)
         self.current_state: ckproto.PeerDynamicInfo = ckproto.PeerDynamicInfo()
         self.current_state.clock = 0
         # `includeds`, `excludeds`, etc. are initially empty lists
@@ -78,8 +80,7 @@ class KeychainUserIdentity:
             encryption_algorithm=serialization.NoEncryption()
         )
 
-    # --- Step 3: Implement Signing Method ---
-    def _sign_payload(self, message: Message, type_prefix: bytes) -> ckproto.SignedInfo: # <-- 3. FIX TYPE HINT
+    def _sign_payload(self, message: Message, type_prefix: bytes) -> ckproto.SignedInfo:
         """Signs a protobuf message with the identity's signing key."""
         serialized_info = message.SerializeToString()
         data_to_sign = type_prefix + serialized_info
@@ -95,6 +96,7 @@ class KeychainUserIdentity:
             ec.ECDSA(Prehashed(hashes.SHA384())) # Sign the hash
         )
 
+        # ** FIX: Constructor ** (Already done correctly here)
         signed_info = ckproto.SignedInfo()
         signed_info.info = serialized_info
         signed_info.signature = signature
@@ -111,13 +113,14 @@ class KeychainUserIdentity:
 
     def to_cuttlefish_peer(self, stable_info_signed: ckproto.SignedInfo, voucher: ckproto.SignedInfo | None = None) -> ckproto.CuttlefishPeer:
         """Constructs the CuttlefishPeer protobuf message for this identity."""
+        # ** FIX: Constructor ** (Already done correctly here)
         peer = ckproto.CuttlefishPeer()
-        peer.hash = self.identifier
-        peer.permanent_info.CopyFrom(self.info)
-        peer.stable_info.CopyFrom(stable_info_signed)
-        peer.dynamic_info.CopyFrom(self.sign_dynamic_info())
+        peer.hash = self.identifier # type: ignore
+        peer.permanent_info.CopyFrom(self.info) # type: ignore
+        peer.stable_info.CopyFrom(stable_info_signed) # type: ignore
+        peer.dynamic_info.CopyFrom(self.sign_dynamic_info()) # type: ignore
         if voucher:
-            peer.voucher.CopyFrom(voucher)
+            peer.voucher.CopyFrom(voucher) # type: ignore
         return peer
 
     # TODO: Implement `vouch_for` if this identity needs to act as a sponsor (unlikely for findmy.py)

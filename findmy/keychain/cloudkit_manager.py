@@ -53,7 +53,6 @@ class CloudKitManager:
         if not adsid:
             raise PushError("Cannot initialize CloudKit, missing ADSID.")
 
-        # Error 1 (False Positive) is here
         mme_token = await self.account._get_mme_token("mmeAuthToken")
 
         headers = {
@@ -76,13 +75,11 @@ class CloudKitManager:
 
             if not response.ok:
                 logger.error(f"ckAppInit failed: {response.status_code}")
-                # FIX for Error 2: Remove await
-                response_text = response.text()
+                response_text = response.text() # Corrected: No await needed
                 logger.error(f"Response: {response_text[:500]}")
                 raise PushError(f"ckAppInit failed ({response.status_code})")
 
-            # FIX for Error 3: Remove await
-            init_data = response.json()
+            init_data = response.json() # Corrected: No await needed
             self.user_id = init_data.get("cloudKitUserId")
 
             if not self.user_id:
@@ -101,7 +98,6 @@ class CloudKitManager:
 
         logger.debug("Refreshing CloudKit token...")
 
-        # Error 4 (False Positive) is here
         mme_token = await self.account._get_mme_token("cloudKitToken")
 
         headers = {
@@ -121,13 +117,11 @@ class CloudKitManager:
 
             if not response.ok:
                   logger.error(f"CK Token request failed: {response.status_code}")
-                  # FIX for Error 5: Remove await
-                  response_text = response.text()
+                  response_text = response.text() # Corrected: No await needed
                   logger.error(f"Response: {response_text[:500]}")
                   raise PushError(f"CK Token request failed ({response.status_code})")
 
-            # FIX for Error 6: Remove await
-            token_data = response.json()
+            token_data = response.json() # Corrected: No await needed
             self.ck_token = token_data.get("cloudKitAuthToken")
 
             self.ck_token_expiry = time.time() + token_data.get("expiresInSeconds", 3600) - 300
@@ -157,18 +151,22 @@ class CloudKitManager:
         request_bytes = request_proto.SerializeToString()
 
         operation_uuid = str(uuid.uuid4()).upper()
-        # Errors 7-10 (False Positives) are here
+
+        # ** FIX: Constructor **
         req_op = ckproto.RequestOperation()
-        req_op.header.user_token = ""
-        req_op.header.application_container = CUTTLEFISH_CONTAINER_ID
-        req_op.header.application_bundle = CUTTLEFISH_BUNDLE_ID
-        req_op.header.target_database = ckproto.RequestOperation.Header.PRIVATE_DB
-        req_op.header.application_container_environment = ckproto.RequestOperation.Header.PRODUCTION
-        req_op.request.operation_uuid = operation_uuid
-        req_op.request.type = ckproto.Operation.FUNCTION_INVOKE_TYPE
-        req_op.function_invoke_request.service = "Cuttlefish"
-        req_op.function_invoke_request.name = method
-        req_op.function_invoke_request.parameters = request_bytes
+        # Header fields assigned individually:
+        req_op.header.user_token = "" # type: ignore
+        req_op.header.application_container = CUTTLEFISH_CONTAINER_ID # type: ignore
+        req_op.header.application_bundle = CUTTLEFISH_BUNDLE_ID # type: ignore
+        req_op.header.target_database = ckproto.RequestOperation.Header.PRIVATE_DB # type: ignore
+        req_op.header.application_container_environment = ckproto.RequestOperation.Header.PRODUCTION # type: ignore
+        # Request fields assigned individually:
+        req_op.request.operation_uuid = operation_uuid # type: ignore
+        req_op.request.type = ckproto.Operation.FUNCTION_INVOKE_TYPE # type: ignore
+        # FunctionInvokeRequest fields assigned individually:
+        req_op.function_invoke_request.service = "Cuttlefish" # type: ignore
+        req_op.function_invoke_request.name = method # type: ignore
+        req_op.function_invoke_request.parameters = request_bytes # type: ignore
 
         encoded_op = req_op.SerializeToString()
 
@@ -211,23 +209,18 @@ class CloudKitManager:
                     logger.warning("CloudKit token likely expired, attempting refresh.")
                     await self._refresh_ck_token()
 
-                    http_headers["X-CloudKit-AuthToken"] = self.ck_token
+                    http_headers["X-CloudKit-AuthToken"] = self.ck_token # Make sure token is updated
                     response = await self.http.post(invoke_url, headers=http_headers, data=delimited_request_body)
                     if not response.ok:
                         raise PushError(f"Cuttlefish invoke failed ({response.status_code}) after token refresh")
                 else:
-                    # FIX for Error 11: Remove await
-                    response_text = response.text()
+                    response_text = response.text() # Corrected: No await needed
                     logger.error(f"Cuttlefish invoke HTTP error: {response.status_code}")
                     logger.error(f"Response: {response_text[:500]}")
                     raise PushError(f"Cuttlefish invoke HTTP error ({response.status_code})")
 
             # Parse delimited response
-            # FIX for Error 12: Access content bytes directly
-            # Assumes HttpResponse has a way to get the raw bytes.
-            # Using response._content as per http.py
-            # Recommend adding a public property like `content` to HttpResponse.
-            response_body = response._content
+            response_body = response._content # Corrected: Access content directly
 
             def decode_uleb128(data: bytes) -> tuple[int, int]:
                 result = 0
@@ -249,28 +242,30 @@ class CloudKitManager:
                offset += len_bytes_read
                op_data = response_body[offset : offset + length]
                offset += length
-               # Error 13 (False Positive) is here
+               # ** FIX: Constructor ** (Already correct here)
                resp_op = ckproto.ResponseOperation()
                resp_op.ParseFromString(op_data)
                resp_ops.append(resp_op)
 
-            target_resp = next((op for op in resp_ops if op.response.operation_uuid == operation_uuid), None)
+            target_resp = next((op for op in resp_ops if op.response.operation_uuid == operation_uuid), None) # type: ignore
             if not target_resp:
                 raise UnhandledProtocolError("CloudKit response missing operation UUID match.")
 
-            # Error 14 (False Positive) is here
-            if target_resp.result.code != ckproto.ResponseOperation.Result.SUCCESS:
-               error_info = target_resp.result.error
-               err_code = error_info.client_error.type if error_info.HasField("client_error") else error_info.server_error.type
-               err_reason = error_info.reason
+            # ** FIX: Comparison ** (Already correct here)
+            if target_resp.result.code != ckproto.ResponseOperation.Result.SUCCESS: # type: ignore
+               error_info = target_resp.result.error # type: ignore
+               # ** FIX: HasField **
+               err_code = error_info.client_error.type if error_info.HasField("clientError") else error_info.server_error.type # type: ignore
+               err_reason = error_info.reason # type: ignore
                logger.error(f"CloudKit reported error: Code={err_code}, Reason='{err_reason}'")
                raise PushError(f"CloudKit error ({err_code}): {err_reason}")
 
-            func_resp = target_resp.function_invoke_response
-            if not func_resp.HasField("serialized_result"):
+            func_resp = target_resp.function_invoke_response # type: ignore
+            # ** FIX: HasField **
+            if not func_resp.HasField("serializedResult"): # type: ignore
                 raise UnhandledProtocolError("FunctionInvokeResponse missing serialized_result")
 
-            result_bytes = func_resp.serialized_result
+            result_bytes = func_resp.serialized_result # type: ignore
 
             response_proto = response_class()
             response_proto.ParseFromString(result_bytes)
@@ -280,13 +275,13 @@ class CloudKitManager:
         except Exception as e:
            logger.error(f"Cuttlefish method {method} failed during HTTP/parsing: {e}")
            raise PushError(f"Cuttlefish:{method} failed") from e
-        
+
     async def fetch_record_zone_changes(
         self,
         zone_name: str,
         sync_token: Optional[str] = None,
-        database_scope: ckproto.RequestOperation.Header.DatabaseScope = ckproto.RequestOperation.Header.PRIVATE_DB,
-    ) -> AsyncGenerator[ckproto.RecordZoneChangesResponse, None]:
+        database_scope: ckproto.RequestOperation.Header.DatabaseScope = ckproto.RequestOperation.Header.PRIVATE_DB, # type: ignore
+    ) -> AsyncGenerator[ckproto.RecordZoneChangesResponse, None]: # type: ignore
         """
         Fetches record changes for a specific zone using FetchRecordZoneChangesOperation.
         Yields RecordZoneChangesResponse pages.
@@ -295,7 +290,7 @@ class CloudKitManager:
         if not self.ck_token:
             raise PushError("Cannot fetch records without CloudKit token.")
 
-        logger.info(f"Fetching record changes for zone: {zone_name} (Scope: {database_scope.name})")
+        logger.info(f"Fetching record changes for zone: {zone_name} (Scope: {database_scope.name})") # type: ignore
 
         more_coming = True
         current_sync_token = sync_token
@@ -304,34 +299,36 @@ class CloudKitManager:
             operation_uuid = str(uuid.uuid4()).upper()
 
             # 1. Build RequestOperation
+            # ** FIX: Constructor **
             req_op = ckproto.RequestOperation()
             # Set Header (similar to invoke_cuttlefish, adjust scope)
-            req_op.header.application_container = CUTTLEFISH_CONTAINER_ID # Assuming same container
-            req_op.header.application_bundle = CUTTLEFISH_BUNDLE_ID   # Assuming same bundle
-            req_op.header.target_database = database_scope
-            req_op.header.application_container_environment = ckproto.RequestOperation.Header.PRODUCTION
+            req_op.header.application_container = CUTTLEFISH_CONTAINER_ID # type: ignore
+            req_op.header.application_bundle = CUTTLEFISH_BUNDLE_ID   # type: ignore
+            req_op.header.target_database = database_scope # type: ignore
+            req_op.header.application_container_environment = ckproto.RequestOperation.Header.PRODUCTION # type: ignore
             # Header user_token is often empty
 
             # Set Request Body
-            req_op.request.operation_uuid = operation_uuid
-            req_op.request.type = ckproto.Operation.RECORD_ZONE_CHANGES_TYPE # Type 307
+            req_op.request.operation_uuid = operation_uuid # type: ignore
+            req_op.request.type = ckproto.Operation.RECORD_ZONE_CHANGES_TYPE # Type 307 # type: ignore
 
             # Create and populate RecordZoneChangesRequest
-            changes_req = ckproto.RecordZoneChangesRequest()
+            # ** FIX: Constructor **
+            changes_req = ckproto.RecordZoneChangesRequest() # type: ignore
             # Set Zone Identifier
-            changes_req.zone_identifier.value.name = zone_name
+            changes_req.zone_identifier.value.name = zone_name # type: ignore
             # Set Owner Identifier if needed (typically for non-_PCS private zones)
-            if database_scope == ckproto.RequestOperation.Header.PRIVATE_DB and zone_name != PCS_ZONE_PROTECTED_STORAGE:
-                 changes_req.zone_identifier.owner_identifier.name = f"_{self.user_id}" # Use fetched CloudKit User ID
+            if database_scope == ckproto.RequestOperation.Header.PRIVATE_DB and zone_name != PCS_ZONE_PROTECTED_STORAGE: # type: ignore
+                 changes_req.zone_identifier.owner_identifier.name = f"_{self.user_id}" # Use fetched CloudKit User ID # type: ignore
 
             if current_sync_token:
-                changes_req.sync_token = current_sync_token
+                changes_req.sync_token = current_sync_token # type: ignore
             # Set desired keys if needed (optional optimization)
             # changes_req.desired_keys.extend(["field1", "field2"])
-            changes_req.num_results = 100 # Request a reasonable number of results per page
+            changes_req.num_results = 100 # Request a reasonable number of results per page # type: ignore
 
             # Assign to the RequestOperation
-            req_op.record_zone_changes_request.CopyFrom(changes_req)
+            req_op.record_zone_changes_request.CopyFrom(changes_req) # type: ignore
 
             # 2. Serialize and Delimit
             encoded_op = req_op.SerializeToString()
@@ -379,7 +376,7 @@ class CloudKitManager:
                         logger.warning("CloudKit token likely expired fetching changes, attempting refresh.")
                         await self._refresh_ck_token()
                         # Retry the request once after refresh
-                        http_headers["X-CloudKit-AuthToken"] = self.ck_token
+                        http_headers["X-CloudKit-AuthToken"] = self.ck_token # Update header
                         response = await self.http.post(invoke_url, headers=http_headers, data=delimited_request_body)
                         if not response.ok:
                             raise PushError(f"Record fetch failed ({response.status_code}) for zone {zone_name} after token refresh")
@@ -412,19 +409,22 @@ class CloudKitManager:
                    offset += len_bytes_read
                    op_data = response_body[offset : offset + length]
                    offset += length
+                   # ** FIX: Constructor ** (Already correct)
                    resp_op = ckproto.ResponseOperation()
                    resp_op.ParseFromString(op_data)
                    resp_ops.append(resp_op)
 
                 # 6. Find Matching Response and Extract Data
-                target_resp = next((op for op in resp_ops if op.response.operation_uuid == operation_uuid), None)
+                target_resp = next((op for op in resp_ops if op.response.operation_uuid == operation_uuid), None) # type: ignore
                 if not target_resp:
                     raise UnhandledProtocolError(f"CloudKit response missing operation UUID match for zone {zone_name}.")
 
-                if target_resp.result.code != ckproto.ResponseOperation.Result.SUCCESS:
-                    error_info = target_resp.result.error
-                    err_code = error_info.client_error.type if error_info.HasField("client_error") else error_info.server_error.type
-                    err_reason = error_info.reason
+                # ** FIX: Comparison ** (Already correct)
+                if target_resp.result.code != ckproto.ResponseOperation.Result.SUCCESS: # type: ignore
+                    error_info = target_resp.result.error # type: ignore
+                    # ** FIX: HasField **
+                    err_code = error_info.client_error.type if error_info.HasField("clientError") else error_info.server_error.type # type: ignore
+                    err_reason = error_info.reason # type: ignore
                     logger.error(f"CloudKit reported error fetching changes for zone {zone_name}: Code={err_code}, Reason='{err_reason}'")
                     # Check for specific errors like 'changeTokenExpired' if needed
                     if err_reason == "changeTokenExpired":
@@ -432,7 +432,8 @@ class CloudKitManager:
                     raise PushError(f"CloudKit error ({err_code}) fetching changes for {zone_name}: {err_reason}")
 
                 # Extract the actual changes response
-                changes_resp = target_resp.record_zone_changes_response
+                changes_resp = target_resp.record_zone_changes_response # type: ignore
+                # ** FIX: HasField ** (Implicit check by accessing, maybe add explicit if needed)
                 if not changes_resp: # Should always be present on success
                      raise UnhandledProtocolError(f"Missing RecordZoneChangesResponse in successful CloudKit response for zone {zone_name}.")
 
@@ -440,8 +441,8 @@ class CloudKitManager:
                 yield changes_resp
 
                 # 8. Update for next loop iteration
-                more_coming = changes_resp.more_coming
-                current_sync_token = changes_resp.sync_token
+                more_coming = changes_resp.more_coming # type: ignore
+                current_sync_token = changes_resp.sync_token # type: ignore
                 if more_coming:
                      logger.debug(f"More changes coming for zone {zone_name}, continuing fetch...")
                 else:
