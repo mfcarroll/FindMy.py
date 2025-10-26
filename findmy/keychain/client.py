@@ -21,7 +21,7 @@ from findmy.reports.anisette import BaseAnisetteProvider
 from findmy.errors import PushError, InvalidStateError
 from .cuttlefish_client import CuttlefishClient
 from findmy.reports.account import AsyncAppleAccount
-from . import crypto_util, asn1_defs
+from findmy.keychain import crypto_util, asn1_defs
 from .constants import (
     PCS_ZONE_PROTECTED_STORAGE, ZONE_MANATEE, ZONE_ENGRAM,
     RECORD_TYPE_SYNCKEY, RECORD_TYPE_ITEM, RECORD_TYPE_CURRENT_ITEM,

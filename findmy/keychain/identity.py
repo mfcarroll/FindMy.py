@@ -11,7 +11,7 @@ from cryptography.hazmat.primitives.asymmetric.utils import Prehashed
 from cryptography.exceptions import InvalidSignature
 
 # Import the generated protobuf classes
-from . import cloudkit_pb2 as ckproto
+from findmy.keychain import cloudkit_pb2 as ckproto
 from google.protobuf.message import Message  # <-- 2. ADD THIS IMPORT
 
 logger = logging.getLogger(__name__)

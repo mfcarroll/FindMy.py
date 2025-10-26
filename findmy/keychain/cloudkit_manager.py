@@ -9,7 +9,7 @@ from google.protobuf.message import Message
 
 from findmy.errors import PushError, UnhandledProtocolError, InvalidStateError
 from findmy.util.http import HttpSession, HttpResponse
-from . import cloudkit_pb2 as ckproto
+from findmy.keychain import cloudkit_pb2 as ckproto
 from .constants import PCS_ZONE_PROTECTED_STORAGE
 
 # Type hints to avoid circular import
