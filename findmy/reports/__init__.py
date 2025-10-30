@@ -6,8 +6,8 @@ from .anisette import (
     BaseAnisetteProvider,
     LocalAnisetteMapping,
     LocalAnisetteProvider,
-    RemoteAnisetteMapping,
-    RemoteAnisetteProvider,
+    # RemoteAnisetteMapping,
+    # RemoteAnisetteProvider,
 )
 from .reports import (
     LocationReport,
@@ -43,8 +43,8 @@ __all__ = (
     "LocationReportEncryptedMapping",
     "LocationReportMapping",
     "LoginState",
-    "RemoteAnisetteMapping",
-    "RemoteAnisetteProvider",
+    # "RemoteAnisetteMapping",
+    # "RemoteAnisetteProvider",
     "SmsSecondFactorMethod",
     "SyncSmsSecondFactor",
     "SyncTrustedDeviceSecondFactor",

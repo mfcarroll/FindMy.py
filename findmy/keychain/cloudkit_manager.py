@@ -280,8 +280,10 @@ class CloudKitManager:
         self,
         zone_name: str,
         sync_token: Optional[str] = None,
-        database_scope: ckproto.RequestOperation.Header.DatabaseScope = ckproto.RequestOperation.Header.PRIVATE_DB, # type: ignore
-    ) -> AsyncGenerator[ckproto.RecordZoneChangesResponse, None]: # type: ignore
+        database_scope: ckproto.RequestOperation.Header.Database = (
+            ckproto.RequestOperation.Header.Database.PRIVATE_DB
+        ) # type: ignore
+    ) -> AsyncGenerator[ckproto.RetrieveChangesResponse, None]: # type: ignore
         """
         Fetches record changes for a specific zone using FetchRecordZoneChangesOperation.
         Yields RecordZoneChangesResponse pages.

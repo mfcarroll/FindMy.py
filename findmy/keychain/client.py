@@ -1150,55 +1150,124 @@ class KeychainClient:
                     sync_token=current_sync_token,
                     # database_scope can be specified if not PRIVATE_DB
                 ):
-                    # Process changes in the response
-                    # ** FIX: HasField **
-                    if not changes_resp.HasField("changes_by_record_type"):  # type: ignore
+                    # Normalize common field names used across different proto versions
+                    # 1) sync token field
+                    sync_token_val = getattr(changes_resp, "sync_token", None)
+                    if sync_token_val is None:
+                        sync_token_val = getattr(changes_resp, "syncToken", None)
+
+                    # 2) more_coming field (snake_case vs camelCase)
+                    more_coming_val = getattr(changes_resp, "more_coming", None)
+                    if more_coming_val is None:
+                        more_coming_val = getattr(changes_resp, "moreComing", False)
+
+                    # 3) changes map field - try multiple likely names
+                    changes_map = None
+                    for candidate in (
+                        "changes_by_record_type",
+                        "changesByRecordType",
+                        "changes_by_type",
+                        "changesByType",
+                        "changes",
+                    ):
+                        if hasattr(changes_resp, candidate):
+                            changes_map = getattr(changes_resp, candidate)
+                            break
+
+                    # If there's no changes_map or it's empty, treat this page as having no changes
+                    if not changes_map:
                         logger.debug("No changes in this response page.")
-                        # Update token even if no changes on this specific page
-                        new_sync_token = changes_resp.sync_token  # type: ignore
-                        more_coming = (
-                            changes_resp.more_coming
-                        )  # Check if server indicates more # type: ignore
-                        current_sync_token = (
-                            new_sync_token  # Use new token for next request
-                        )
+                        # Update token even if no changes on this page
+                        new_sync_token = sync_token_val
+                        more_coming = bool(more_coming_val)
+                        current_sync_token = new_sync_token
                         break  # Exit inner loop for this page
 
-                    for (
-                        change
-                    ) in (
-                        changes_resp.changes_by_record_type
-                    ):  # Iterate through RecordZoneChanges # type: ignore
-                        record = (
-                            change.record
-                        )  # The actual Record protobuf # type: ignore
-                        record_name = record.record_identifier.value.name  # type: ignore
+                    # Iterate through the record-type → change-list mapping.
+                    # The mapping may be a dict-like object, a protobuf map, or a repeated message.
+                    # Try to iterate in multiple ways to be robust.
+                    try:
+                        # If it's a mapping (has .items), iterate keys and values
+                        iterator = getattr(changes_map, "items", None)
+                        if iterator:
+                            items_iter = iterator()
+                        else:
+                            # Otherwise assume it's iterable of pairs or messages
+                            items_iter = iter(changes_map)
+                    except Exception:
+                        items_iter = iter(changes_map)
 
-                        if change.type == ckproto.RecordZoneChangesResponse.Change.DELETE:  # type: ignore
-                            removed = zone_items.pop(record_name, None)
-                            if removed:
-                                logger.debug(
-                                    f"Deleted record {record_name} from zone {zone_name}."
-                                )
+                    for entry in items_iter:
+                        # Determine how this entry is represented:
+                        # - If it's a (key, value) pair
+                        # - If it's a message that has 'record_type'/'recordType' and 'changes' fields
+                        record_type = None
+                        entry_changes = None
+
+                        if isinstance(entry, tuple) and len(entry) == 2:
+                            record_type, entry_changes = entry
+                        else:
+                            # Try attributes
+                            record_type = getattr(entry, "record_type", None) or getattr(entry, "recordType", None)
+                            entry_changes = getattr(entry, "changes", None) or getattr(entry, "changesList", None) or getattr(entry, "changes_list", None)
+
+                        if record_type is None or entry_changes is None:
+                            # Try alternate structure where changes_map may be indexed by record type
+                            try:
+                                # If `changes_map` supports iteration over keys, and entry is a key
+                                record_type = entry
+                                entry_changes = changes_map[entry]
+                            except Exception:
+                                logger.debug("Unrecognized changes_map entry format; skipping.")
+                                continue
+
+                        # Now `entry_changes` should be an iterable of change objects
+                        for change in entry_changes:
+                            # The change may be a wrapper message with .record or fields directly
+                            record = getattr(change, "record", None) or getattr(change, "recordField", None) or getattr(change, "record_inner", None)
+                            if record is None:
+                                logger.debug("Change entry without record field; skipping.")
+                                continue
+
+                            # Extract record name safely
+                            try:
+                                record_name = (
+                                    record.record_identifier.value.name
+                                )  # type: ignore
+                            except Exception:
+                                record_name = getattr(record, "name", None) or "unknown"
+
+                            # Determine delete/create/update semantics (enum might be named differently)
+                            # Best-effort mapping: look for `type`, `change_type`, or `operation`
+                            change_type = getattr(change, "type", None) or getattr(change, "change_type", None) or getattr(change, "operation", None)
+
+                            # CloudKit RecordChange "type" values from RetrieveChangesResponse
+                            # According to the proto, RecordChange has an int32 'type' field.
+                            # Commonly: 1 = UPDATE/CREATE, 2 = DELETE.
+                            RECORD_CHANGE_TYPE_UPDATE = 1
+                            RECORD_CHANGE_TYPE_DELETE = 2
+
+                            if change_type == RECORD_CHANGE_TYPE_DELETE:
+                                removed = zone_items.pop(record_name, None)
+                                if removed:
+                                    logger.debug(f"Deleted record {record_name} from zone {zone_name}.")
+                                    changes_processed += 1
+                                else:
+                                    logger.debug(f"Tried to delete unknown record {record_name} in zone {zone_name}.")
+                            else:
+                                # CREATE or UPDATE
+                                zone_items[record_name] = record
+                                logger.debug(f"Created/Updated record {record_name} in zone {zone_name}.")
                                 changes_processed += 1
-                        else:  # CREATE or UPDATE
-                            zone_items[record_name] = record
-                            logger.debug(
-                                f"Created/Updated record {record_name} in zone {zone_name}."
-                            )
-                            changes_processed += 1
 
                     # Update sync token and pagination flag after processing the page
-                    new_sync_token = changes_resp.sync_token  # type: ignore
-                    more_coming = changes_resp.more_coming  # type: ignore
-                    current_sync_token = (
-                        new_sync_token  # Use new token for the next request
-                    )
+                    new_sync_token = sync_token_val
+                    more_coming = bool(more_coming_val)
+                    current_sync_token = new_sync_token
 
+                    # If server indicates more_coming is False we can break the while loop
                     if not more_coming:
-                        logger.debug(
-                            f"No more changes indicated by server for zone {zone_name}."
-                        )
+                        logger.debug(f"No more changes indicated by server for zone {zone_name}.")
                         break  # Exit the async for loop (generator)
 
                 # After processing all pages from the generator (or breaking early)

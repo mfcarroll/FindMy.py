@@ -38,6 +38,7 @@ from findmy.errors import (
 )
 from findmy.keychain.cloudkit_manager import CloudKitManager
 from findmy.util.http import HttpSession
+from findmy.keychain import identity
 
 from .anisette import AnisetteMapping, get_provider_from_mapping
 from .reports import LocationReport, LocationReportsFetcher
@@ -53,6 +54,8 @@ from .twofactor import (
 )
 
 from findmy.keychain import cloudkit_pb2 as ckproto
+from findmy.keychain.identity import KeychainUserIdentity
+
 from google.protobuf.message import Message
 
 # --- Add this logging configuration ---
@@ -403,6 +406,20 @@ class AsyncAppleAccount(BaseAppleAccount):
         self._reports: LocationReportsFetcher = LocationReportsFetcher(self)
         self._closed: bool = False
         self._cloudkit_manager: Optional[CloudKitManager] = None
+
+        try:
+            identity = KeychainUserIdentity.load_from_disk("identity.json")
+        except Exception:
+            machine_id = self._uid          # use the account's unique device ID
+            model_id = "MacBookPro18,3"     # or any realistic device model string
+            identity = KeychainUserIdentity(machine_id, model_id)  # or KeychainUserIdentity(machine_id, model_id) if required
+
+        # Bind runtime context so identity.account / .anisette / .http are available
+        identity.bind_context(self, self._anisette, self._http)
+
+        # Store on the account for later use
+        self._identity: KeychainUserIdentity = identity
+
 
     async def _get_cloudkit_manager(self) -> CloudKitManager:
         """Initializes and returns the CloudKitManager."""
