@@ -125,13 +125,15 @@ message RequestOperation {
 
   
   message PeerPermanentInfo {
-    optional uint64 epoch = 1;
-    optional bytes signingKey = 2;
-    optional bytes encryptionKey = 3;
-    optional string machineId = 4;
-    optional string modelId = 5;
-    optional uint64 creationTime = 6;
+    optional bytes signing_key = 1;         // Device signing public key
+    optional bytes encryption_key = 2;      // Device encryption public key
+    optional string peer_id = 3;            // Unique peer identifier
+    optional string model_id = 4;           // Model (e.g., MacBookPro18,1)
+    optional string machine_id = 5;         // Randomly generated local machine ID
+    optional string serial_number = 6;      // Hardware serial (optional)
+    optional bytes stable_info = 7;         // Serialized stable info blob
   }
+
 
   message PeerStableInfo {
     optional uint64 clock = 1;

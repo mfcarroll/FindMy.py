@@ -209,3 +209,27 @@ def convert_serialized_key_to_pem(serialized_key: ckproto.CuttlefishSerializedKe
         logger.error(f"Failed to convert DER to PEM: {e}")
         raise ValueError("Could not parse or convert key data") from e
 # --- END CONVERSION FUNCTION ---
+
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.backends import default_backend
+
+def generate_ec_keypair(curve: ec.EllipticCurve = ec.SECP384R1()):
+    """Generate a new EC keypair and return (private_key, public_key)."""
+    private_key = ec.generate_private_key(curve, default_backend())
+    public_key = private_key.public_key()
+    return private_key, public_key
+
+def serialize_private_key(private_key: ec.EllipticCurvePrivateKey) -> bytes:
+    """Serialize an EC private key to PEM format (unencrypted)."""
+    return private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+
+def load_private_key(pem_data: bytes) -> ec.EllipticCurvePrivateKey:
+    """Load an EC private key from PEM bytes."""
+    return serialization.load_pem_private_key(
+        pem_data, password=None, backend=default_backend()
+    )

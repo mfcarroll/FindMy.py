@@ -1,224 +1,164 @@
-# findmy/keychain/identity.py
+"""
+findmy.keychain.identity
+~~~~~~~~~~~~~~~~~~~~~~~~
+Create and persist a local identity for Cuttlefish/CloudKit operations.
+"""
 
-import os
-import time
-import uuid
-import logging
-import base64
+from __future__ import annotations
+
 import json
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.hazmat.primitives.asymmetric.utils import Prehashed
-from cryptography.exceptions import InvalidSignature
+import logging
+import os
+import platform
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import cast
+from typing import Any, Optional, Tuple
 
-# Import the generated protobuf classes
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ec import (
+    EllipticCurvePrivateKey,
+    EllipticCurvePublicKey,
+)
+
+# --- Local imports ------------------------------------------------------------
+
 from findmy.keychain import cloudkit_pb2 as ckproto
-from google.protobuf.message import Message
+from findmy.keychain.helpers.encoded_peer import GeneratedPeer
+from findmy.keychain.crypto_util import (
+    generate_ec_keypair,
+    serialize_private_key,
+    load_private_key,
+)
 
 logger = logging.getLogger(__name__)
 
+IDENTITY_FILE = "identity.json"
 
-# Helper function to match Rust's duration_since_epoch().as_millis()
+
 def duration_since_epoch_millis() -> int:
-    return int(time.time() * 1000)
+    return int(datetime.now(tz=timezone.utc).timestamp() * 1000)
 
 
+def _try_set_field(msg: Any, value: Any, *names: str) -> bool:
+    """
+    Try to set one of the provided field names (or variants) on the protobuf message.
+    Returns True if set, False otherwise.
+    """
+    for name in names:
+        if hasattr(msg, name):
+            try:
+                setattr(msg, name, value)
+                return True
+            except Exception:
+                pass
+    return False
+
+
+# ------------------------------------------------------------------------------
+@dataclass
 class KeychainUserIdentity:
-    """Represents the cryptographic identity of this application instance."""
+    """
+    Represents a CloudKit keychain identity — the persistent local identity
+    used for signing and encryption within the Find My network.
+    """
 
-    def __init__(self, machine_id: str, model_id: str):
-        """Generates a new identity."""
-        logger.info("Generating new Keychain User Identity...")
-        # SECP384r1 curve, matching Rust's Nid::SECP384R1
-        self._signing_key: ec.EllipticCurvePrivateKey = ec.generate_private_key(
-            ec.SECP384R1()
+    machine_id: str
+    model_id: str
+    _signing_key: EllipticCurvePrivateKey
+    _encryption_key: EllipticCurvePrivateKey
+    _permanent_info: ckproto.PeerPermanentInfo
+
+    # --------------------------------------------------------------------------
+
+    def __init__(self, machine_id: Optional[str] = None, model_id: Optional[str] = None):
+        # Generate EC key pairs (P-384)
+        signing_key, signing_pub = generate_ec_keypair()
+        encryption_key, encryption_pub = generate_ec_keypair()
+
+        self._signing_key = signing_key
+        self._encryption_key = encryption_key
+        self.machine_id = machine_id or platform.node()
+        self.model_id = model_id or platform.machine()
+
+        # Build PeerPermanentInfo protobuf
+        self._permanent_info = ckproto.PeerPermanentInfo()
+
+        # Defensive field assignment (handles naming differences)
+        _try_set_field(self._permanent_info, 1, "epoch")
+        _try_set_field(
+            self._permanent_info,
+            signing_pub.public_bytes(
+                serialization.Encoding.DER,
+                serialization.PublicFormat.SubjectPublicKeyInfo,
+            ),
+            "signingKey",
         )
-        self._encryption_key: ec.EllipticCurvePrivateKey = ec.generate_private_key(
-            ec.SECP384R1()
+        _try_set_field(
+            self._permanent_info,
+            encryption_pub.public_bytes(
+                serialization.Encoding.DER,
+                serialization.PublicFormat.SubjectPublicKeyInfo,
+            ),
+            "encryptionKey",
         )
-        logger.debug("Generated signing and encryption key pairs (SECP384r1).")
-
-        # ** FIX: Constructor ** (Already done correctly here)
-        permanent_info = ckproto.PeerPermanentInfo()
-        permanent_info.epoch = 1
-        permanent_info.permanent_key = self._signing_key.public_key().public_bytes(  # type: ignore
-            encoding=serialization.Encoding.DER,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo,
-        )
-        permanent_info.encryption_key = self._encryption_key.public_key().public_bytes(  # type: ignore
-            encoding=serialization.Encoding.DER,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo,
-        )
-
-        permanent_info.machine_id = machine_id  # type: ignore
-        permanent_info.model_id = model_id  # type: ignore
-        permanent_info.creation_time = duration_since_epoch_millis()  # type: ignore
-
-        # Sign the permanent info
-        self.info: ckproto.SignedInfo = self._sign_payload(
-            permanent_info, b"TPPB.PeerPermanentInfo"
-        )
-
-        # Calculate the identifier hash (matches Rust implementation)
-        hasher = hashes.Hash(hashes.SHA256())
-        hasher.update(self.info.info)
-        hasher.update(self.info.signature)
-        info_hash = hasher.finalize()
-        # Use urlsafe_b64encode and remove padding to match Rust's base64_encode behavior
-        self.identifier: str = (
-            f"SHA256:{base64.urlsafe_b64encode(info_hash).decode('ascii').rstrip('=')}"
-        )
-        logger.info(f"Generated Identity ID: {self.identifier}")
-
-        # Initialize dynamic state (clock starts at 0)
-        # ** FIX: Constructor ** (Already done correctly here)
-        self.current_state: ckproto.PeerDynamicInfo = ckproto.PeerDynamicInfo()
-        self.current_state.clock = 0
-        # `includeds`, `excludeds`, etc. are initially empty lists
-
-    def get_signing_key_private_bytes(self) -> bytes:
-        """Returns the private signing key in DER format."""
-        return self._signing_key.private_bytes(
-            encoding=serialization.Encoding.DER,
-            format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=serialization.NoEncryption(),
+        _try_set_field(self._permanent_info, self.machine_id, "machineId")
+        _try_set_field(self._permanent_info, self.model_id, "modelId")
+        _try_set_field(
+            self._permanent_info,
+            int(datetime.now().timestamp()),
+            "creationTime",
         )
 
-    def get_encryption_key_private_bytes(self) -> bytes:
-        """Returns the private encryption key in DER format."""
-        return self._encryption_key.private_bytes(
-            encoding=serialization.Encoding.DER,
-            format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=serialization.NoEncryption(),
+        logger.debug(
+            f"Generated new PeerPermanentInfo for {self.machine_id} "
+            f"({self.model_id}), with EC key pairs."
         )
 
-    def _sign_payload(self, message: Message, type_prefix: bytes) -> ckproto.SignedInfo:
-        """Signs a protobuf message with the identity's signing key."""
-        serialized_info = message.SerializeToString()
-        data_to_sign = type_prefix + serialized_info
-
-        # Hash the data first, as ECDSA typically signs hashes
-        # Rust keychain.rs uses SHA384 for signing payloads
-        hasher = hashes.Hash(hashes.SHA384())
-        hasher.update(data_to_sign)
-        digest = hasher.finalize()
-
-        signature = self._signing_key.sign(
-            digest, ec.ECDSA(Prehashed(hashes.SHA384()))  # Sign the hash
-        )
-
-        # ** FIX: Constructor ** (Already done correctly here)
-        signed_info = ckproto.SignedInfo()
-        signed_info.info = serialized_info
-        signed_info.signature = signature
-        logger.debug(f"Signed payload for type: {type_prefix.decode()}")
-        return signed_info
-
-    def sign_stable_info(
-        self, stable_info: ckproto.PeerStableInfo
-    ) -> ckproto.SignedInfo:
-        """Creates a SignedInfo object for PeerStableInfo."""
-        return self._sign_payload(stable_info, b"TPPB.PeerStableInfo")
-
-    def sign_dynamic_info(self) -> ckproto.SignedInfo:
-        """Creates a SignedInfo object for the current PeerDynamicInfo."""
-        return self._sign_payload(self.current_state, b"TPPB.PeerDynamicInfo")
-
-    def to_cuttlefish_peer(
-        self,
-        stable_info_signed: ckproto.SignedInfo,
-        voucher: ckproto.SignedInfo | None = None,
-    ) -> ckproto.CuttlefishPeer:
-        """Constructs the CuttlefishPeer protobuf message for this identity."""
-        # ** FIX: Constructor ** (Already done correctly here)
-        peer = ckproto.CuttlefishPeer()
-        peer.hash = self.identifier  # type: ignore
-        peer.permanent_info.CopyFrom(self.info)  # type: ignore
-        peer.stable_info.CopyFrom(stable_info_signed)  # type: ignore
-        peer.dynamic_info.CopyFrom(self.sign_dynamic_info())  # type: ignore
-        if voucher:
-            peer.voucher.CopyFrom(voucher)  # type: ignore
-        return peer
-
+    # --------------------------------------------------------------------------
     @classmethod
-    def load_from_disk(
-        cls, path: str | Path = "identity.json"
-    ) -> "KeychainUserIdentity":
-        """Loads a previously saved identity (keys, IDs, state) from disk."""
-        p = Path(path)
-        if not p.exists():
-            raise FileNotFoundError(f"Identity file not found: {p}")
+    def load_from_disk(cls, filename: str = IDENTITY_FILE):
+        """Loads an existing identity from disk."""
+        path = Path(filename)
+        if not path.exists():
+            raise FileNotFoundError(f"Identity file not found: {path}")
 
-        data = json.loads(p.read_text())
-        identity = cls(data["machine_id"], data["model_id"])
+        logger.debug(f"Loading identity from {path}")
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
 
-        # Restore private keys
-        identity._signing_key = cast(
-            ec.EllipticCurvePrivateKey,
-            serialization.load_der_private_key(
-                base64.b64decode(data["signing_key_der"]), password=None
-            ),
-        )
-        identity._encryption_key = cast(
-            ec.EllipticCurvePrivateKey,
-            serialization.load_der_private_key(
-                base64.b64decode(data["encryption_key_der"]), password=None
-            ),
-        )
+        instance = cls(machine_id=data["machine_id"], model_id=data["model_id"])
+        instance._signing_key = load_private_key(data["signing_key"].encode())
+        instance._encryption_key = load_private_key(data["encryption_key"].encode())
 
-        # Restore derived fields
-        identity.identifier = data["identifier"]
-        identity.current_state.clock = data.get("clock", 0)
-        logger.info(f"Loaded KeychainUserIdentity from {p}")
-        return identity
+        logger.debug("Successfully loaded KeychainUserIdentity from disk.")
+        return instance
 
-    def save_to_disk(self, path: str | Path = "identity.json") -> None:
-        """Saves this identity (keys, IDs, state) to disk as JSON."""
-        p = Path(path)
+    # --------------------------------------------------------------------------
+    def save_to_disk(self, filename: str = IDENTITY_FILE):
+        """Saves this identity to disk in JSON format."""
+        path = Path(filename)
         data = {
-            "machine_id": getattr(self.info, "machine_id", ""),
-            "model_id": getattr(self.info, "model_id", ""),
-            "identifier": self.identifier,
-            "signing_key_der": base64.b64encode(
-                self.get_signing_key_private_bytes()
-            ).decode("ascii"),
-            "encryption_key_der": base64.b64encode(
-                self.get_encryption_key_private_bytes()
-            ).decode("ascii"),
-            "clock": getattr(self.current_state, "clock", 0),
+            "machine_id": self.machine_id,
+            "model_id": self.model_id,
+            "signing_key": serialize_private_key(self._signing_key).decode(),
+            "encryption_key": serialize_private_key(self._encryption_key).decode(),
         }
-        p.write_text(json.dumps(data, indent=2))
-        logger.info(f"Saved KeychainUserIdentity to {p}")
 
-    @property
-    def account(self):
-        """Return the bound AsyncAppleAccount if available."""
-        return getattr(self, "_account", None)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
 
-    @property
-    def anisette(self):
-        """Return the anisette provider if available."""
-        return getattr(self, "_anisette", None)
+        logger.debug(f"Saved identity to {path}")
 
-    @property
-    def http(self):
-        """Return the aiohttp session or HTTP client if available."""
-        return getattr(self, "_http", None)
+    # --------------------------------------------------------------------------
+    def to_generated_peer(self):
+        """Converts this identity to a GeneratedPeer (for cuttlefish/vouching)."""
+        return GeneratedPeer.from_identity(self)
 
-    def bind_context(self, account, anisette_provider, http_session):
-        self._account = account
-        self._anisette = anisette_provider
-        self._http = http_session
-
-    # TODO: Implement `vouch_for` if this identity needs to act as a sponsor (unlikely for findmy.py)
-    # def vouch_for(self, beneficiary_id: str) -> ckproto.SignedInfo:
-    #     voucher = ckproto.Voucher()
-    #     voucher.reason = 1 # Typically 1 for standard vouching
-    #     voucher.beneficiary = beneficiary_id
-    #     voucher.sponsor = self.identifier
-    #     return self._sign_payload(voucher, b"TPPB.Voucher")
+    # --------------------------------------------------------------------------
+    def __repr__(self) -> str:  # type: ignore[override]
+        return f"<KeychainUserIdentity machine_id={self.machine_id!r} model_id={self.model_id!r}>"
 
 
-# --- End of findmy/keychain/identity.py ---
+def generate_new_identity(machine_id: str, model_id: str) -> KeychainUserIdentity:
+    return KeychainUserIdentity(machine_id, model_id)

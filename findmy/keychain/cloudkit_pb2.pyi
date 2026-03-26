@@ -435,30 +435,40 @@ global___FunctionInvokeRequest = FunctionInvokeRequest
 class PeerPermanentInfo(google.protobuf.message.Message):
     DESCRIPTOR: google.protobuf.descriptor.Descriptor
 
-    EPOCH_FIELD_NUMBER: builtins.int
-    SIGNINGKEY_FIELD_NUMBER: builtins.int
-    ENCRYPTIONKEY_FIELD_NUMBER: builtins.int
-    MACHINEID_FIELD_NUMBER: builtins.int
-    MODELID_FIELD_NUMBER: builtins.int
-    CREATIONTIME_FIELD_NUMBER: builtins.int
-    epoch: builtins.int
-    signingKey: builtins.bytes
-    encryptionKey: builtins.bytes
-    machineId: builtins.str
-    modelId: builtins.str
-    creationTime: builtins.int
+    SIGNING_KEY_FIELD_NUMBER: builtins.int
+    ENCRYPTION_KEY_FIELD_NUMBER: builtins.int
+    PEER_ID_FIELD_NUMBER: builtins.int
+    MODEL_ID_FIELD_NUMBER: builtins.int
+    MACHINE_ID_FIELD_NUMBER: builtins.int
+    SERIAL_NUMBER_FIELD_NUMBER: builtins.int
+    STABLE_INFO_FIELD_NUMBER: builtins.int
+    signing_key: builtins.bytes
+    """Device signing public key"""
+    encryption_key: builtins.bytes
+    """Device encryption public key"""
+    peer_id: builtins.str
+    """Unique peer identifier"""
+    model_id: builtins.str
+    """Model (e.g., MacBookPro18,1)"""
+    machine_id: builtins.str
+    """Randomly generated local machine ID"""
+    serial_number: builtins.str
+    """Hardware serial (optional)"""
+    stable_info: builtins.bytes
+    """Serialized stable info blob"""
     def __init__(
         self,
         *,
-        epoch: builtins.int | None = ...,
-        signingKey: builtins.bytes | None = ...,
-        encryptionKey: builtins.bytes | None = ...,
-        machineId: builtins.str | None = ...,
-        modelId: builtins.str | None = ...,
-        creationTime: builtins.int | None = ...,
+        signing_key: builtins.bytes | None = ...,
+        encryption_key: builtins.bytes | None = ...,
+        peer_id: builtins.str | None = ...,
+        model_id: builtins.str | None = ...,
+        machine_id: builtins.str | None = ...,
+        serial_number: builtins.str | None = ...,
+        stable_info: builtins.bytes | None = ...,
     ) -> None: ...
-    def HasField(self, field_name: typing.Literal["creationTime", b"creationTime", "encryptionKey", b"encryptionKey", "epoch", b"epoch", "machineId", b"machineId", "modelId", b"modelId", "signingKey", b"signingKey"]) -> builtins.bool: ...
-    def ClearField(self, field_name: typing.Literal["creationTime", b"creationTime", "encryptionKey", b"encryptionKey", "epoch", b"epoch", "machineId", b"machineId", "modelId", b"modelId", "signingKey", b"signingKey"]) -> None: ...
+    def HasField(self, field_name: typing.Literal["encryption_key", b"encryption_key", "machine_id", b"machine_id", "model_id", b"model_id", "peer_id", b"peer_id", "serial_number", b"serial_number", "signing_key", b"signing_key", "stable_info", b"stable_info"]) -> builtins.bool: ...
+    def ClearField(self, field_name: typing.Literal["encryption_key", b"encryption_key", "machine_id", b"machine_id", "model_id", b"model_id", "peer_id", b"peer_id", "serial_number", b"serial_number", "signing_key", b"signing_key", "stable_info", b"stable_info"]) -> None: ...
 
 global___PeerPermanentInfo = PeerPermanentInfo
 
